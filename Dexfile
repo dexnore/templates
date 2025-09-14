@@ -1,0 +1,33 @@
+# syntax=dexnore/dexfile:0
+
+IMPORT --file=./go/Dexfile \
+    local:context \
+    AS go
+IMPORT --file=./node/Dexfile \
+    local:context \
+    AS node
+IMPORT --file=./java/Dexfile \
+    local:context \
+    AS java
+IMPORT --file=./python/Dexfile \
+    local:context \
+    AS python
+
+FROM scratch AS prod
+IF BUILD node
+    BUILD node
+ELSEIF BUILD go
+    BUILD go
+ELSEIF BUILD java
+    BUILD java
+ELSEIF BUILD python
+    BUILD python
+ENDIF
+
+FROM busybox:latest
+IF BUILD prod
+    BUILD prod
+ELSE
+    RUN echo `${STDERR} \
+        no programming language detected. please report at 'https://github.com/dexnore/templates' if it is not expected` >&2 && exit 1
+ENDIF

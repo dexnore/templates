@@ -1,0 +1,181 @@
+# syntax=dexnore/dexfile:0
+
+# This Dockerfile uses Dexfile syntax. For more information, see:
+# https://github.com/dexnore/dexfile
+
+ARG MAVEN_CLI_OPTS="-B -DskipTests"
+ARG PORT=3000
+ARG BUILD_IMAGE RUN_IMAGE RUNTIME_JRE_VERSION
+
+CTR --mount=target=. busybox FROM busybox:latest
+    IF PROC [ -z "${BUILD_IMAGE}" ]
+        IF PROC [ -f "pom.xml" ]
+            ARG BUILD_IMAGE=maven:3.9-eclipse-temurin-17
+            IF PROC set -euo pipefail && SOURCE_VERSION=$(awk -F'[<>]' '/maven.compiler.source/{print $3}' pom.xml) && [ ! -z "$SOURCE_VERSION" ] && echo $SOURCE_VERSION
+                ARG BUILD_IMAGE="maven:3.9-eclipse-temurin-${STDOUT}"
+                ARG RUNTIME_JRE_VERSION=${STDOUT}
+            ENDIF
+        ELSEIF PROC [ -f "build.gradle" ]
+            ARG BUILD_IMAGE=gradle:8-jdk17
+            IF PROC TARGET_VERSION=$(awk -F'[<>]' '/sourceCompatibility/{print $3}' build.gradle) && echo $TARGET_VERSION
+                ARG BUILD_IMAGE="gradle:8-jdk${STDOUT}"
+                ARG RUN_IMAGE="eclipse-temurin:${STDOUT}-jre"
+                ARG RUNTIME_JRE_VERSION=${STDOUT}
+            ELSEIF PROC VERSION=$(awk -F'=' '/^java.version=/{print $2}' gradle.properties 2>/dev/null) && echo $VERSION
+                ARG BUILD_IMAGE="gradle:8-jdk${STDOUT}"
+                ARG RUN_IMAGE="eclipse-temurin:${STDOUT}-jre"
+                ARG RUNTIME_JRE_VERSION=${STDOUT}
+            ENDIF
+        ELSEIF PROC [ -f "build.xml" ]
+            ARG BUILD_IMAGE=eclipse-temurin:17
+            IF PROC TARGET_VERSION=$(awk -F'[<>]' '/<javac[^>]*source=/{gsub(/"/,"",$2); print $2}' build.xml) && echo $TARGET_VERSION
+                ARG BUILD_IMAGE="eclipse-temurin:${STDOUT}"
+                ARG RUN_IMAGE="eclipse-temurin:${STDOUT}-jre"
+                ARG RUNTIME_JRE_VERSION=${STDOUT}
+            ENDIF
+        ELSE
+            RUN echo "no 'pom.xml', 'build.gradle' or 'build.xml' file found!" >&2 && exit 1;
+        ENDIF
+    ENDIF
+
+    IF PROC [ -z "${RUN_IMAGE}" ]
+        ARG RUN_IMAGE=eclipse-temurin:17-jre
+        IF PROC TARGET_VERSION=$(awk -F'[<>]' '/maven.compiler.target/{print $3}' pom.xml) && echo $TARGET_VERSION
+            ARG RUN_IMAGE="eclipse-temurin:${STDOUT}-jre"
+            ARG RUNTIME_JRE_VERSION=${STDOUT}
+        ENDIF
+        IF PROC TARGET_VERSION=$(awk -F'[<>]' '/targetCompatibility/{print $3}' build.gradle) && echo $TARGET_VERSION
+            ARG RUN_IMAGE="eclipse-temurin:${STDOUT}-jre"
+            ARG RUNTIME_JRE_VERSION=${STDOUT}
+        ENDIF
+        IF PROC TARGET_VERSION=$(awk -F'[<>]' '/<javac[^>]*target=/{gsub(/"/,"",$2); print $2}' build.xml) && echo $TARGET_VERSION
+            ARG RUN_IMAGE="eclipse-temurin:${STDOUT}-jre"
+            ARG RUNTIME_JRE_VERSION=${STDOUT}
+        ENDIF
+    ENDIF
+
+    IF PROC (PACKAGING=$(awk -F'[<>]' '/<packaging>/{print $3}' pom.xml) && [ "$PACKAGING" = "war" ]) || \
+            (grep -q "id 'war'" build.gradle 2>/dev/null) || (grep -q "id 'war'" build.gradle.kts 2>/dev/null) || \
+            (grep -q '<war ' build.xml 2>/dev/null)
+        ARG RUN_IMAGE="tomcat:10-jre17-temurin"
+        IF PROC [ ! -z "${RUNTIME_JRE_VERSION}" ]
+            ARG RUN_IMAGE="tomcat:10-jre${RUNTIME_JRE_VERSION}-temurin"
+        ENDIF
+    ENDIF
+ENDCTR
+
+
+FROM ${BUILD_IMAGE} AS base
+RUN addgroup dexnore && adduser --ingroup dexnore dexfile --disabled-password
+WORKDIR /home/dexfile/app
+USER dexfile:dexnore
+ENV MAVEN_OPTS="-Xmx512m -XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0"
+ENV JAVA_OPTS="-Xmx512m -XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0"
+ENV MAVEN_CONFIG="/home/dexfile/.m2"
+
+FROM base AS deps
+COPY --chown=dexfile:dexnore \
+    pom.xml* \
+    settings.xml* \
+    build.gradle* \
+    build.gradle.kts* \
+    settings.gradle* \
+    settings.gradle.kts* \
+    gradle.properties* \
+    build.xml* \
+    mvnw* \
+    gradlew* \
+    /home/dexfile/app/
+IF RUN [ -f "gradlew" ]
+    RUN chmod +x gradlew
+ENDIF
+IF RUN [ -f "mvnw" ]
+    RUN chmod +x mvnw
+ENDIF
+
+IF RUN [ -f "mvnw" ]
+    RUN --mount=type=secret,id=m2settings,target=settings.xml \
+        --mount=type=cache,target=~/.m2 \
+        ./mvnw $MAVEN_CLI_OPTS dependency:go-offline
+ELSEIF RUN [ -f "gradlew" ]
+    RUN --mount=type=cache,target=~/.gradle \
+        ./gradlew --no-daemon dependencies || true
+ELSEIF RUN [ -f "pom.xml" ]
+    RUN --mount=type=secret,id=m2settings,target=settings.xml \
+        --mount=type=cache,target=~/.m2 \
+        mvn $MAVEN_CLI_OPTS dependency:go-offline
+ELSEIF RUN [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]
+    RUN --mount=type=cache,target=~/.gradle \
+        gradle --no-daemon dependencies || true
+ELSEIF RUN [ -f "build.xml" ]
+    RUN --mount=type=cache,target=/root/.ivy2 ant -version || true
+ENDIF
+
+
+FROM base AS builder
+COPY --from=deps --chown=dexfile:dexnore . .
+IF RUN [ -f "mvnw" ]
+    RUN --mount=type=secret,id=m2settings,target=settings.xml \
+        --mount=type=cache,target=~/.m2 \
+        ./mvnw $MAVEN_CLI_OPTS clean package
+    IF RUN PACKAGING=$(awk -F'[<>]' '/<packaging>/{print $3}' pom.xml) && [ "$PACKAGING" = "war" ]
+        RUN mkdir -p ./dexfile-artifact && cp target/*.war ./dexfile-artifact/app.war || true
+    ELSE
+        RUN mkdir -p ./dexfile-artifact && cp target/*.jar ./dexfile-artifact/app.jar || true
+    ENDIF
+ELSEIF RUN [ -f "gradlew" ]
+    RUN --mount=type=cache,target=~/.gradle \
+        ./gradlew --no-daemon clean build
+    IF RUN grep -q "id 'war'" build.gradle 2>/dev/null || grep -q "id 'war'" build.gradle.kts 2>/dev/null
+        RUN mkdir -p ./dexfile-artifact && cp build/libs/*.war ./dexfile-artifact/app.war || true
+    ELSE
+        RUN mkdir -p ./dexfile-artifact && cp build/libs/*.jar ./dexfile-artifact/app.jar || true
+    ENDIF
+ELSEIF RUN [ -f "pom.xml" ]
+    RUN --mount=type=secret,id=m2settings,target=settings.xml \
+        mvn $MAVEN_CLI_OPTS clean package
+    IF RUN PACKAGING=$(awk -F'[<>]' '/<packaging>/{print $3}' pom.xml) && [ "$PACKAGING" = "war" ]
+        RUN mkdir -p ./dexfile-artifact && cp target/*.war ./dexfile-artifact/app.war || true
+    ELSE
+        RUN mkdir -p ./dexfile-artifact && cp target/*.jar ./dexfile-artifact/app.jar || true
+    ENDIF
+ELSEIF RUN [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]
+    RUN --mount=type=cache,target=~/.gradle \
+        gradle --no-daemon clean build
+    IF RUN grep -q "id 'war'" build.gradle 2>/dev/null || grep -q "id 'war'" build.gradle.kts 2>/dev/null
+        RUN mkdir -p ./dexfile-artifact && cp build/libs/*.war ./dexfile-artifact/app.war || true
+    ELSE
+        RUN mkdir -p ./dexfile-artifact && cp build/libs/*.jar ./dexfile-artifact/app.jar || true
+    ENDIF
+ELSEIF RUN [ -f "build.xml" ]
+    RUN --mount=type=cache,target=/root/.ivy2 \
+        ant -Dskip.tests=true
+    IF RUN grep -q '<war ' build.xml 2>/dev/null
+        RUN mkdir -p ./dexfile-artifact && cp dist/*.war ./dexfile-artifact/app.war || cp build/*.war ./dexfile-artifact/app.war || true
+    ELSE
+        RUN mkdir -p ./dexfile-artifact && cp dist/*.jar ./dexfile-artifact/app.jar || cp build/*.jar ./dexfile-artifact/app.jar || true
+    ENDIF
+ELSE
+    RUN echo "no 'pom.xml', 'build.gradle' or 'build.xml' file found while building!" >&2 && exit 1;
+ENDIF
+
+FROM ${RUN_IMAGE} AS production
+RUN addgroup dexnore && adduser --ingroup dexnore dexfile --disabled-password
+WORKDIR /home/dexfile/app
+USER dexfile:dexnore
+ENV JAVA_TOOL_OPTIONS="-XX:+UseContainerSupport -XX:ActiveProcessorCount=2 -XX:MaxRAMPercentage=75.0"
+ENV PORT=${PORT}
+EXPOSE ${PORT}
+CTR --mount=target=. builder FROM builder
+    IF PROC [ -f "/home/dexfile/app/dexfile-artifact/app.war" ]
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dexfile-artifact/app.war /usr/local/tomcat/webapps/ROOT.war
+        HEALTHCHECK --interval=30s --timeout=5s --start-period=30s CMD curl -f http://127.0.0.1:${PORT}/ || exit 1
+        ENTRYPOINT [ "catalina.sh", "run" ]
+    ELSE
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dexfile-artifact/app.jar /home/dexfile/app/dexfile-artifact/app.jar
+        ENTRYPOINT [ "java", "$JAVA_TOOL_OPTIONS", "-jar", "/home/dexfile/app/dexfile-artifact/app.jar" ]
+    ENDIF
+ENDCTR
+
+FROM production AS release
+LABEL maintainer="@dexnore/dexfile"

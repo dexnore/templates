@@ -1,0 +1,69 @@
+# syntax=dexnore/dexfile:0
+
+# This Dockerfile uses Dexfile syntax. For more information, see:
+# https://github.com/dexnore/dexfile
+
+ARG GO_ENTRYPOINT=.
+
+CTR --mount=target=. base-img
+    IF PROC [ ! -f "go.mod" ]
+        RUN echo "no 'go.mod' file found in the project" >&2 && exit 1;
+    ENDIF
+ENDCTR
+
+FROM golang:latest AS base
+
+FROM base AS builder
+COPY go.mod go.sum* /home/dexfile/app/
+IF RUN [ ! -f "go.sum" ]
+    RUN go mod tidy
+ENDIF
+RUN --mount=type=cache,target=/go-cache \
+    go mod download
+# COPY . .
+RUN --mount=target=/home/dexfile/app/ \
+    --mount=type=cache,target=/ \
+    set -euo pipefail && \
+    OUTPUT_BIN=/dexfile-app && \
+    echo "Trying build from GO_MAIN_PATH=$GO_MAIN_PATH" && \
+    if CGO_ENABLED=0 go build -buildmode=pie \
+        -ldflags="-w -s -extldflags '-static'" \
+        -tags osusergo,netgo \
+        -trimpath \
+        -o "$OUTPUT_BIN" \
+        "$GO_MAIN_PATH"; then \
+        echo "Build succeeded from GO_MAIN_PATH"; \
+    else \
+        echo "Build from GO_MAIN_PATH failed, detecting main package dynamically..." >&2 && \
+        MAIN_DIR=$(find . -type f -name '*.go' \
+            ! -name '*_test.go' \
+            ! -path './vendor/*' \
+            -exec grep -q '^package main' {} \; \
+            -exec grep -q '^func main\s*(' {} \; \
+            -print -quit \
+            | xargs -r dirname) && \
+        echo "Detected main dir: ${MAIN_DIR:-<none>}" && \
+        if [ -n "$MAIN_DIR" ]; then \
+            echo "Trying build from $MAIN_DIR" && \
+            CGO_ENABLED=0 go build -buildmode=pie \
+                -ldflags="-w -s -extldflags '-static'" \
+                -tags osusergo,netgo \
+                -trimpath \
+                -o "$OUTPUT_BIN" \
+                "$MAIN_DIR"; \
+        else \
+            echo "No main package found, build failed" >&2 && exit 1; \
+        fi; \
+    fi
+
+
+FROM scratch AS prod
+RUN addgroup dexnore && adduser --ingroup dexnore dexfile --disabled-password
+WORKDIR /home/dexfile/app
+USER dexfile:dexnore
+COPY --chown=dexfile:dexnore --from=builder ./dexfile-app .
+
+FROM prod AS release
+ENTRYPOINT [ "dexfile-app" ]
+EXPOSE 3000
+LABEL maintainer="@dexnore/dexfile"
