@@ -5,28 +5,26 @@
 
 ARG BUILD_IMAGE RUN_IMAGE PORT BUILD_IMAGE_VERSION NGINX_ROOT
 WORKDIR /home/dexfile/app
-CTR --mount=target=. bin
-    IF PROC [ ! -f "package.json" ]
-        RUN echo "no 'package.json' file found!" >&2 && exit 1;
-    ENDIF
+IF PROC --mount=target=. [ ! -f "package.json" ]
+    RUN echo "no 'package.json' file found!" >&2 && exit 1;
+ENDIF
 
-    IF PROC [ -z "${BUILD_IMAGE}" ]
-        IF PROC [ -f "bun.lockb" ] || [ -f "bun.lock" ]
-            IF PROC [ -z "${BUILD_IMAGE_VERSION}" ] && [ -f ".bun-version" ] && cat .bun-version
-                ARG BUILD_IMAGE_VERSION=$STDOUT
-            ENDIF
-            ARG BUILD_IMAGE=oven/bun:${BUILD_IMAGE_VERSION:+${BUILD_IMAGE_VERSION}-}alpine
-        ELSE IF PROC [ -f "lock.json" ] || [ -s "deno.json" ] || [ -s "deno.jsonc" ]
-            ARG BUILD_IMAGE=denoland/deno:alpine
+IF PROC [ -z "${BUILD_IMAGE}" ]
+    IF PROC --mount=target=. [ -f "bun.lockb" ] || [ -f "bun.lock" ]
+        IF PROC --mount=target=. [ -z "${BUILD_IMAGE_VERSION}" ] && [ -f ".bun-version" ] && cat .bun-version
+            ARG BUILD_IMAGE_VERSION=$STDOUT
         ENDIF
+        ARG BUILD_IMAGE=oven/bun:${BUILD_IMAGE_VERSION:+${BUILD_IMAGE_VERSION}-}alpine
+    ELSE IF PROC --mount=target=. [ -f "lock.json" ] || [ -s "deno.json" ] || [ -s "deno.jsonc" ]
+        ARG BUILD_IMAGE=denoland/deno:alpine
     ENDIF
+ENDIF
 
-    IF PROC [ -z "${RUN_IMAGE}" ]
-        IF PROC [ -f "nginx.conf" ]
-            ARG RUN_IMAGE=nginx:stable-alpine-slim
-        ENDIF
+IF PROC [ -z "${RUN_IMAGE}" ]
+    IF PROC --mount=target=. [ -f "nginx.conf" ]
+        ARG RUN_IMAGE=nginx:stable-alpine-slim
     ENDIF
-ENDCTR
+ENDIF
 
 FROM ${BUILD_IMAGE:-node:lts-alpine} AS base
 WORKDIR /home/dexfile/app
@@ -252,18 +250,17 @@ IF RUN /usr/local/bin/nginx_custom_script.sh root nginx.conf && [ -z "${NGINX_RO
     ARG NGINX_ROOT=${STDOUT:-/usr/share/nginx/html}
 ENDIF
 
-CTR --mount=target=. base-img
-    IF PROC [ -f "nx.json" ] && [ ! -f "nginx.conf" ]
-        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dist/apps/* /home/dexfile/app/
-    ELSE IF PROC [ ! -f "nx.json" ] && [ ! -f "nginx.conf" ]
-        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app /home/dexfile/app
-    ELSE IF PROC [ ! -f "nx.json" ] && [ -f "nginx.conf" ]
-        COPY --chown=root:root --from=builder /home/dexfile/app/* ${NGINX_ROOT}
-    ELSE
-        COPY --chown=root:root --from=builder /home/dexfile/app/dist/apps/* ${NGINX_ROOT}
-    ENDIF
+IF PROC --mount=target=. [ -f "nx.json" ] && [ ! -f "nginx.conf" ]
+    COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dist/apps/* /home/dexfile/app/
+ELSE IF PROC --mount=target=. [ ! -f "nx.json" ] && [ ! -f "nginx.conf" ]
+    COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app /home/dexfile/app
+ELSE IF PROC --mount=target=. [ ! -f "nx.json" ] && [ -f "nginx.conf" ]
+    COPY --chown=root:root --from=builder /home/dexfile/app/* ${NGINX_ROOT}
+ELSE
+    COPY --chown=root:root --from=builder /home/dexfile/app/dist/apps/* ${NGINX_ROOT}
+ENDIF
 
-    RUN cat <<'EOF' > /usr/local/bin/entrypoint.sh
+RUN cat <<'EOF' > /usr/local/bin/entrypoint.sh
 #!/bin/sh
 
 if [ -f "nginx.conf" ]; then
@@ -281,9 +278,8 @@ exec npm run start
 fi
 EOF
 
-    RUN chmod +x /usr/local/bin/entrypoint.sh
-    CMD [ "/usr/local/bin/entrypoint.sh" ]
-ENDCTR
+RUN chmod +x /usr/local/bin/entrypoint.sh
+CMD [ "/usr/local/bin/entrypoint.sh" ]
 
 FROM prod AS release
 EXPOSE ${PORT:-3000}
