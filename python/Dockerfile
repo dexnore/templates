@@ -106,32 +106,64 @@ COPY pyproject.toml poetry.lock* Pipfile* Pipfile.lock* \
      uv.lock* requirements.txt* environment.yml* environment.yaml* setup.py* setup.cfg* /home/dexfile/app/
 
 # Build wheels / install dependencies  // ~/.cache/pip
-RUN set -eux; \
+RUN --mount=type=cache,target=wheels \
+    set -eux; \
+    echo ">>> Starting dependency resolution and wheel build"; \
     mkdir -p wheels; \
-    # Conda
+    \
+    # --- Conda Environment ---
     if [ -f environment.yml ]; then \
-        conda env create -f environment.yml --quiet && conda clean --all --yes; \
+        echo "Detected Conda environment.yml..."; \
+        conda env create -f environment.yml --quiet; \
+        conda clean --all --yes; \
     elif [ -f environment.yaml ]; then \
-        conda env create -f environment.yaml --quiet && conda clean --all --yes; \
-    # Pipenv
+        echo "Detected Conda environment.yaml..."; \
+        conda env create -f environment.yaml --quiet; \
+        conda clean --all --yes; \
+    \
+    # --- Pipenv ---
     elif [ -f Pipfile ] && [ -f Pipfile.lock ]; then \
+        echo "Detected Pipenv..."; \
         pipenv install --deploy --system; \
-        [ -f requirements.txt ] && pip wheel --no-cache-dir --no-deps --wheel-dir wheels -r requirements.txt || true; \
-    # Poetry
+        echo "Building wheels for installed packages..."; \
+        pip freeze | grep -v "^-e" > /tmp/requirements.installed.txt; \
+        pip wheel --no-cache-dir --no-deps --wheel-dir wheels -r /tmp/requirements.installed.txt; \
+    \
+    # --- Poetry ---
     elif [ -f poetry.lock ] && [ -f pyproject.toml ]; then \
-        $HOME/.local/bin/poetry config virtualenvs.create false; \
-        $HOME/.local/bin/poetry build -f wheel; \
-        cp dist/*.whl wheels/; \
-    # UV
+        echo "Detected Poetry..."; \
+        if command -v poetry >/dev/null 2>&1; then \
+            poetry config virtualenvs.create false; \
+            poetry install --no-root; \
+            poetry build -f wheel; \
+            cp dist/*.whl wheels/; \
+            echo "Building wheels for installed packages..."; \
+            pip freeze | grep -v "^-e" > /tmp/requirements.installed.txt; \
+            pip wheel --no-cache-dir --no-deps --wheel-dir wheels -r /tmp/requirements.installed.txt; \
+        else \
+            echo "Error: poetry not installed or not in PATH." >&2; \
+            exit 1; \
+        fi; \
+    \
+    # --- UV ---
     elif [ -f uv.lock ]; then \
+        echo "Detected UV..."; \
         uv install; \
-        [ -f requirements.txt ] && pip wheel --no-cache-dir --no-deps --wheel-dir wheels -r requirements.txt || true; \
-    # Requirements.txt fallback
+        echo "Building wheels for installed packages..."; \
+        pip freeze | grep -v "^-e" > /tmp/requirements.installed.txt; \
+        pip wheel --no-cache-dir --no-deps --wheel-dir wheels -r /tmp/requirements.installed.txt; \
+    \
+    # --- Plain Requirements.txt ---
     elif [ -f requirements.txt ]; then \
+        echo "Detected requirements.txt..."; \
         pip wheel --no-cache-dir --no-deps --wheel-dir wheels -r requirements.txt; \
+    \
+    # --- No recognized dependency file ---
     else \
-        echo "No recognized dependency file found"; exit 1; \
-    fi
+        echo "No recognized dependency file found (expected environment.yml, Pipfile, poetry.lock, uv.lock, or requirements.txt)." >&2; \
+        exit 1; \
+    fi; \
+    echo ">>> Wheel build completed and cached successfully."
 
 # ========================
 # Stage 3: Installer (final runtime)
