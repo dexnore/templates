@@ -64,26 +64,24 @@ FUNC ant
     ENDIF
 ENDFUNC
 
-CTR --mount=target=. busybox FROM busybox:latest
-    IF PROC [ -f "pom.xml" ]
-        FUNC CALL maven
-    ELSE IF PROC [ -f "build.gradle" ]
-        FUNC CALL gradle
-    ELSE IF PROC [ -f "build.xml" ]
-        FUNC CALL ant
-    ELSE
-        RUN echo "no 'pom.xml', 'build.gradle' or 'build.xml' file found!" >&2 && exit 1;
-    ENDIF
+IF PROC --from=busybox:latest --mount=target=. [ -f "pom.xml" ]
+    FUNC CALL maven
+ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "build.gradle" ]
+    FUNC CALL gradle
+ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "build.xml" ]
+    FUNC CALL ant
+ELSE
+    RUN echo "no 'pom.xml', 'build.gradle' or 'build.xml' file found!" >&2 && exit 1;
+ENDIF
 
-    IF PROC (PACKAGING=$(awk -F'[<>]' '/<packaging>/{print $3}' pom.xml) && [ "$PACKAGING" = "war" ]) || \
-        (grep -q "id 'war'" build.gradle 2>/dev/null) || (grep -q "id 'war'" build.gradle.kts 2>/dev/null) || \
-        (grep -q '<war ' build.xml 2>/dev/null)
-        ARG RUN_IMAGE="tomcat:10-jre17-temurin"
-        IF PROC [ ! -z "${RUNTIME_JRE_VERSION}" ]
-            ARG RUN_IMAGE="tomcat:10-jre${RUNTIME_JRE_VERSION}-temurin"
-        ENDIF
+IF PROC --from=busybox:latest --mount=target=. (PACKAGING=$(awk -F'[<>]' '/<packaging>/{print $3}' pom.xml) && [ "$PACKAGING" = "war" ]) || \
+    (grep -q "id 'war'" build.gradle 2>/dev/null) || (grep -q "id 'war'" build.gradle.kts 2>/dev/null) || \
+    (grep -q '<war ' build.xml 2>/dev/null)
+    ARG RUN_IMAGE="tomcat:10-jre17-temurin"
+    IF PROC --from=busybox:latest [ ! -z "${RUNTIME_JRE_VERSION}" ]
+        ARG RUN_IMAGE="tomcat:10-jre${RUNTIME_JRE_VERSION}-temurin"
     ENDIF
-ENDCTR
+ENDIF
 
 FROM ${BUILD_IMAGE} AS base
 WORKDIR /home/dexfile/app
@@ -153,16 +151,14 @@ ENV PORT=${PORT}
 EXPOSE ${PORT}
 
 FROM app AS prod
-CTR --mount=target=. builder FROM builder
-    IF PROC [ -f "/home/dexfile/app/dexfile-artifact/app.war" ]
-        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dexfile-artifact/app.war /usr/local/tomcat/webapps/ROOT.war
-        HEALTHCHECK --interval=30s --timeout=5s --start-period=30s CMD curl -f http://127.0.0.1:${PORT}/ || exit 1
-        ENTRYPOINT [ "catalina.sh", "run" ]
-    ELSE
-        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dexfile-artifact/app.jar /home/dexfile/app/dexfile-artifact/app.jar
-        ENTRYPOINT [ "java", "$JAVA_TOOL_OPTIONS", "-jar", "/home/dexfile/app/dexfile-artifact/app.jar" ]
-    ENDIF
-ENDCTR
+IF PROC --from=builder --mount=target=. [ -f "/home/dexfile/app/dexfile-artifact/app.war" ]
+    COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dexfile-artifact/app.war /usr/local/tomcat/webapps/ROOT.war
+    HEALTHCHECK --interval=30s --timeout=5s --start-period=30s CMD curl -f http://127.0.0.1:${PORT}/ || exit 1
+    ENTRYPOINT [ "catalina.sh", "run" ]
+ELSE
+    COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dexfile-artifact/app.jar /home/dexfile/app/dexfile-artifact/app.jar
+    ENTRYPOINT [ "java", "$JAVA_TOOL_OPTIONS", "-jar", "/home/dexfile/app/dexfile-artifact/app.jar" ]
+ENDIF
 
 FROM prod AS release
 LABEL maintainer="@dexnore/dexfile"
