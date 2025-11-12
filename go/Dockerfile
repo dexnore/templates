@@ -9,11 +9,9 @@ ARG LD_FLAGS
 ARG BUILD_IMAGE \
     RUN_IMAGE
 WORKDIR /home/dexfile/app
-CTR --mount=target=. base-img
-    IF PROC [ ! -f "go.mod" ]
-        RUN echo "no 'go.mod' file found in the project" >&2 && exit 1;
-    ENDIF
-ENDCTR
+IF PROC --mount=target=. [ ! -f "go.mod" ]
+    RUN echo "no 'go.mod' file found in the project" >&2 && exit 1;
+ENDIF
 
 FROM ${BUILD_IMAGE:-golang:latest} AS base
 WORKDIR /home/dexfile/app
