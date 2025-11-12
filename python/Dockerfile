@@ -5,47 +5,70 @@
 
 ARG BUILD_IMAGE RUN_IMAGE
 WORKDIR /home/dexfile/app
-PROC --mount=target=. find . -type -f \( \
-        -name "requirements*.txt" -o \
-        -name "poetry.lock" -o \
-        -name "Pipfile.lock" -o \
-        -name "pdm.lock" -o \
-        -name "uv.lock" -o \
-        -name "environment.yml" -o \
-        -name "environment.yaml" -o \
-        -name "pyproject.toml" -o \
-        -name "setup.py" -o \
-        -name "setup.cfg" \
-    \) -print -quit | grep -q . || ( \
+PROC --mount=target=. find . -type f 2>/dev/null | grep -m1 \
+    -e 'requirements' \
+    -e 'poetry.lock' \
+    -e 'Pipfile.lock' \
+    -e 'pdm.lock' \
+    -e 'uv.lock' \
+    -e 'environment.yml' \
+    -e 'environment.yaml' \
+    -e 'pyproject.toml' \
+    -e 'setup.py' \
+    -e 'setup.cfg' \
+    >/dev/null; then \
+        echo "Python project detected"; \
+    else \
         echo "Not a python project" >&2; \
         exit 1; \
-    ) && echo "Python project detected"
+    fi
 
-IF PROC --mount=target=. VERSIONS=""; \
-    if [ -f ".python-version" ]; then \
-        PYTHON_VERSION=$(cat .python-version | tr -d ' '); \
-        VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
-    if [ -f "pyproject.toml" ]; then \
-        PYTHON_VERSION=$(grep -E "requires-python" pyproject.toml | sed 's/.*=//g' | tr -d '" '); \
-        VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
-    if [ -f "setup.py" ]; then \
-        PYTHON_VERSION=$(grep -E "python_requires" setup.py | sed 's/.*=//g' | tr -d '" ,'); \
-        VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
-    if [ -f "Pipfile" ]; then \
-        PYTHON_VERSION=$(grep -A1 "\[requires\]" Pipfile | grep "python_version" | sed 's/.*=//g' | tr -d '" '); \
-        VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
-    if [ -f "requirements.txt" ]; then \
-        PYTHON_VERSION=$(grep -i "python" requirements.txt | awk '{print $NF}'); \
-        VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
+IF PROC --mount=target=. if [ -n "${BUILD_IMAGE}" ]; then \
+        echo "BUILD_IMAGE is already set — refusing to auto-detect Python version." >&2; \
+        exit 1; \
+    fi; \
+    PYTHON_IMAGE_SUFFIX="${PYTHON_IMAGE_SUFFIX:-"-slim"}"; \
+    VERSIONS=""; \
+    for FILE in $(find . -type f \( \
+        -name ".python-version" -o \
+        -name "pyproject.toml" -o \
+        -name "setup.py" -o \
+        -name "Pipfile" \
+    \) 2>/dev/null); do \
+        case "$FILE" in \
+            *.python-version) \
+                PYTHON_VERSION=$(cat "$FILE" | tr -d ' \t\r'); \
+                ;; \
+            *pyproject.toml) \
+                RAW=$(grep -E "requires-python" "$FILE" 2>/dev/null || true); \
+                PYTHON_VERSION=$(echo "$RAW" | sed 's/.*=//g' | tr -d '" ' | \
+                    tr ',' '\n' | grep -Eo '[0-9]+\.[0-9]+' | sort -V | tail -n 1); \
+                ;; \
+            *setup.py) \
+                RAW=$(grep -E "python_requires" "$FILE" 2>/dev/null || true); \
+                PYTHON_VERSION=$(echo "$RAW" | sed 's/.*=//g' | tr -d '" ,' | \
+                    tr ',' '\n' | grep -Eo '[0-9]+\.[0-9]+' | sort -V | tail -n 1); \
+                ;; \
+            *Pipfile) \
+                RAW=$(grep -A1 "\[requires\]" "$FILE" 2>/dev/null | grep "python_version" || true); \
+                PYTHON_VERSION=$(echo "$RAW" | sed 's/.*=//g' | tr -d '" ' | \
+                    tr ',' '\n' | grep -Eo '[0-9]+\.[0-9]+' | sort -V | tail -n 1); \
+                ;; \
+        esac; \
+        [ -n "$PYTHON_VERSION" ] && VERSIONS="$VERSIONS $PYTHON_VERSION"; \
+    done; \
     CLEANED=$(echo "$VERSIONS" | sed 's/[<>=!~]//g'); \
     REQUIRED=$(echo "$CLEANED" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+' | sort -V | tail -n 1); \
-    [ -n "$REQUIRED" ] && echo "$REQUIRED-slim";
-    IF PROC [ -z "${BUILD_IMAGE}" ]
-        ARG BUILD_IMAGE=python:${STDOUT:-latest}-slim
-    ENDIF
+    if [ -n "$REQUIRED" ]; then \
+        echo "${REQUIRED}${PYTHON_IMAGE_SUFFIX}"; \
+    else \
+        echo "No valid Python version found in project files." >&2; \
+        exit 1; \
+    fi
 
+    ARG BUILD_IMAGE=python:${STDOUT:-latest}
     IF PROC [ -z "${RUN_IMAGE}" ]
-        ARG RUN_IMAGE=python:${STDOUT:-latest}-slim
+        ARG RUN_IMAGE=${BUILD_IMAGE}
     ENDIF
 ENDIF
 
@@ -158,9 +181,7 @@ RUN mkdir -p /usr/local/bin
 COPY <<'EOF' /usr/local/bin/python-entrypoint.py
 #!/usr/bin/env python3
 """
-Ultra-clean production-ready Python ENTRYPOINT for Docker.
 Auto-detects FastAPI/Flask/Django/CLI apps and selects the best server.
-FIXED: Addressed fragile heuristics and server fallback logic.
 """
 
 import os
