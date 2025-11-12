@@ -5,55 +5,53 @@
 
 ARG BUILD_IMAGE RUN_IMAGE
 WORKDIR /home/dexfile/app
-CTR --mount=target=. py
-    PROC find . -type -f \( \
-            -name "requirements*.txt" -o \
-            -name "poetry.lock" -o \
-            -name "Pipfile.lock" -o \
-            -name "pdm.lock" -o \
-            -name "uv.lock" -o \
-            -name "environment.yml" -o \
-            -name "environment.yaml" -o \
-            -name "pyproject.toml" -o \
-            -name "setup.py" -o \
-            -name "setup.cfg" \
-        \) -print -quit | grep -q . || ( \
-            echo "Not a python project" >&2; \
-            exit 1; \
-        ) && echo "Python project detected"
-    
-    IF PROC VERSIONS=""; \
-        if [ -f ".python-version" ]; then \
-            PYTHON_VERSION=$(cat .python-version | tr -d ' '); \
-            VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
-        if [ -f "pyproject.toml" ]; then \
-            PYTHON_VERSION=$(grep -E "requires-python" pyproject.toml | sed 's/.*=//g' | tr -d '" '); \
-            VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
-        if [ -f "setup.py" ]; then \
-            PYTHON_VERSION=$(grep -E "python_requires" setup.py | sed 's/.*=//g' | tr -d '" ,'); \
-            VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
-        if [ -f "Pipfile" ]; then \
-            PYTHON_VERSION=$(grep -A1 "\[requires\]" Pipfile | grep "python_version" | sed 's/.*=//g' | tr -d '" '); \
-            VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
-        if [ -f "requirements.txt" ]; then \
-            PYTHON_VERSION=$(grep -i "python" requirements.txt | awk '{print $NF}'); \
-            VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
-        CLEANED=$(echo "$VERSIONS" | sed 's/[<>=!~]//g'); \
-        REQUIRED=$(echo "$CLEANED" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+' | sort -V | tail -n 1); \
-        [ -n "$REQUIRED" ] && echo "$REQUIRED-slim";
-        IF PROC [ -z "${BUILD_IMAGE}" ]
-            ARG BUILD_IMAGE=python:${STDOUT:-latest}-slim
-        ENDIF
+PROC --mount=target=. find . -type -f \( \
+        -name "requirements*.txt" -o \
+        -name "poetry.lock" -o \
+        -name "Pipfile.lock" -o \
+        -name "pdm.lock" -o \
+        -name "uv.lock" -o \
+        -name "environment.yml" -o \
+        -name "environment.yaml" -o \
+        -name "pyproject.toml" -o \
+        -name "setup.py" -o \
+        -name "setup.cfg" \
+    \) -print -quit | grep -q . || ( \
+        echo "Not a python project" >&2; \
+        exit 1; \
+    ) && echo "Python project detected"
 
-        IF PROC [ -z "${RUN_IMAGE}" ]
-            ARG RUN_IMAGE=python:${STDOUT:-latest}-slim
-        ENDIF
+IF PROC --mount=target=. VERSIONS=""; \
+    if [ -f ".python-version" ]; then \
+        PYTHON_VERSION=$(cat .python-version | tr -d ' '); \
+        VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
+    if [ -f "pyproject.toml" ]; then \
+        PYTHON_VERSION=$(grep -E "requires-python" pyproject.toml | sed 's/.*=//g' | tr -d '" '); \
+        VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
+    if [ -f "setup.py" ]; then \
+        PYTHON_VERSION=$(grep -E "python_requires" setup.py | sed 's/.*=//g' | tr -d '" ,'); \
+        VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
+    if [ -f "Pipfile" ]; then \
+        PYTHON_VERSION=$(grep -A1 "\[requires\]" Pipfile | grep "python_version" | sed 's/.*=//g' | tr -d '" '); \
+        VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
+    if [ -f "requirements.txt" ]; then \
+        PYTHON_VERSION=$(grep -i "python" requirements.txt | awk '{print $NF}'); \
+        VERSIONS="$VERSIONS $PYTHON_VERSION"; fi; \
+    CLEANED=$(echo "$VERSIONS" | sed 's/[<>=!~]//g'); \
+    REQUIRED=$(echo "$CLEANED" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+' | sort -V | tail -n 1); \
+    [ -n "$REQUIRED" ] && echo "$REQUIRED-slim";
+    IF PROC [ -z "${BUILD_IMAGE}" ]
+        ARG BUILD_IMAGE=python:${STDOUT:-latest}-slim
     ENDIF
 
-    IF PROC [ -f "environment.yml" ]
-        ARG BUILD_IMAGE=continuumio/miniconda3
+    IF PROC [ -z "${RUN_IMAGE}" ]
+        ARG RUN_IMAGE=python:${STDOUT:-latest}-slim
     ENDIF
-ENDCTR
+ENDIF
+
+IF PROC --mount=target=. [ -f "environment.yml" ]
+    ARG BUILD_IMAGE=continuumio/miniconda3
+ENDIF
 
 # ========================
 # Stage 1: Base image
@@ -84,7 +82,7 @@ FROM base AS deps
 COPY pyproject.toml poetry.lock* Pipfile* Pipfile.lock* \
      uv.lock* requirements.txt* environment.yml* environment.yaml* setup.py* setup.cfg* /home/dexfile/app/
 
-# Build wheels / install dependencies
+# Build wheels / install dependencies  // ~/.cache/pip
 RUN set -eux; \
     mkdir -p wheels; \
     # Conda
