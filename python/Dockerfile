@@ -107,6 +107,8 @@ COPY pyproject.toml poetry.lock* Pipfile* Pipfile.lock* \
 
 # Build wheels / install dependencies  // ~/.cache/pip
 RUN --mount=type=cache,target=wheels \
+    --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/opt/conda/pkgs \
     set -eux; \
     echo ">>> Starting dependency resolution and wheel build"; \
     mkdir -p wheels; \
@@ -173,7 +175,7 @@ WORKDIR /home/dexfile/app
 
 # Copy wheels + dependency files
 COPY --from=deps /home/dexfile/app/wheels /home/dexfile/app/wheels
-COPY --from=deps pyproject.toml setup.py setup.cfg requirements.txt* uv.lock* \
+COPY --from=deps pyproject.toml* setup.py* setup.cfg* requirements.txt* uv.lock* \
      environment.yml* environment.yaml* /home/dexfile/app/
 
 # Install dependencies from wheels (cached)
@@ -186,7 +188,8 @@ RUN set -eux; \
         pip install --no-cache-dir .; \
     else \
         echo "Nothing to install"; exit 1; \
-    fi
+    fi; \
+    pip cache purge || true
 
 # ========================
 # Stage 4: Builder (copy source)
@@ -204,7 +207,7 @@ RUN groupadd -r dexnore && useradd -r -g dexnore dexfile
 WORKDIR /home/dexfile/app
 USER dexfile:dexnore
 
-COPY --from=builder /home/dexfile/app /home/dexfile/app
+COPY . /home/dexfile/app
 
 # ------------------------
 # Create python-entrypoint.py dynamically (full script)
