@@ -3,6 +3,10 @@
 # This Dockerfile uses Dexfile syntax. For more information, see:
 # https://github.com/dexnore/dexfile
 
+#################################################
+## TODO: need to support Makefiles             ##
+#################################################
+
 ARG GO_ENTRYPOINT=.
 ARG GO_OUTPUT_BIN_PATH=/dexfile-app
 ARG GO_LD_FLAGS="-s -w"
