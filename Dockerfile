@@ -39,24 +39,73 @@ IMPORT --file=./rust/Dexfile \
     local:context \
     AS rust
 
+#####################################
+
+IMPORT --file=./go/Dexfile \
+    --target=meta-stage \
+    local:context \
+    AS go-detect
+
+IMPORT --file=./node/Dexfile \
+    --target=meta-stage \
+    local:context \
+    AS node-detect
+
+IMPORT --file=./java/Dexfile \
+    --target=meta-stage \
+    local:context \
+    AS java-detect
+
+IMPORT --file=./python/Dexfile \
+    --target=meta-stage \
+    local:context \
+    AS python-detect
+
+IMPORT --file=./php/Dexfile \
+    --target=meta-stage \
+    local:context \
+    AS php-detect
+
+IMPORT --file=./ruby/Dexfile \
+    --target=meta-stage \
+    local:context \
+    AS ruby-detect
+
+IMPORT --file=./dart/Dexfile \
+    --target=meta-stage \
+    local:context \
+    AS dart-detect
+
+IMPORT --file=./csharp/Dexfile \
+    --target=meta-stage \
+    local:context \
+    AS csharp-detect
+
+IMPORT --file=./rust/Dexfile \
+    --target=meta-stage \
+    local:context \
+    AS rust-detect
+
+#####################################
+
 FROM busybox:latest AS prod
-IF BUILD node
+IF BUILD node-detect
     BUILD node
-ELSE IF BUILD go
+ELSE IF BUILD go-detect
     BUILD go
-ELSE IF BUILD java
+ELSE IF BUILD java-detect
     BUILD java
-ELSE IF BUILD python
+ELSE IF BUILD python-detect
     BUILD python
-ELSE IF BUILD php
+ELSE IF BUILD php-detect
     BUILD php
-ELSE IF BUILD ruby
+ELSE IF BUILD ruby-detect
     BUILD ruby
-ELSE IF BUILD dart
+ELSE IF BUILD dart-detect
     BUILD dart
-ELSE IF BUILD csharp
+ELSE IF BUILD csharp-detect
     BUILD csharp
-ELSE IF BUILD rust
+ELSE IF BUILD rust-detect
     BUILD rust
 ELSE
     RUN echo "no programming language detected" >&2 && \
