@@ -12,8 +12,6 @@ ARG BUILD_IMAGE \
     GO_MAIN_GLOB \
     GOOS \
     GOARCH \
-    GO_LD_FLAGS \
-    GO_BUILD_TAGS \
     GO_MULTI_BIN \
     CROSS_MATRIX \
     MAKE_ENABLED \
