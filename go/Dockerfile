@@ -3,16 +3,25 @@
 # This Dockerfile uses Dexfile syntax. For more information, see:
 # https://github.com/dexnore/dexfile
 
-#################################################
-## TODO: need to support Makefiles             ##
-#################################################
-
 ARG GO_ENTRYPOINT=.
 ARG GO_OUTPUT_BIN_PATH=/dexfile-app
 ARG GO_LD_FLAGS="-s -w"
 ARG GO_BUILD_TAGS="osusergo netgo static_build"
 ARG BUILD_IMAGE \
-    RUN_IMAGE
+    RUN_IMAGE \
+    GO_MAIN_GLOB \
+    GOOS \
+    GOARCH \
+    GO_LD_FLAGS \
+    GO_BUILD_TAGS \
+    GO_MULTI_BIN \
+    CROSS_MATRIX \
+    MAKE_ENABLED \
+    MAKE_TARGET \
+    JUST_ENABLED \
+    JUST_TARGET \
+    TASK_ENABLED \
+    TASK_TARGET
 WORKDIR /home/dexfile/app
 # --- Validation Stage ---
 IF PROC --mount=target=. [ ! -f "go.mod" ]
@@ -43,9 +52,6 @@ WORKDIR /home/dexfile/app
 # --- Build Stage ---
 FROM base AS builder
 COPY go.mod go.sum* /home/dexfile/app/
-IF RUN [ ! -f "go.sum" ]
-    RUN go mod tidy
-ENDIF
 # Separate dependency download for better caching
 RUN --mount=type=cache,target=/root/.cache,sharing=shared,id=dexfile-root-cache \
     --mount=type=cache,target=/go/pkg/mod,sharing=shared,id=dexfile-mod-cache \
@@ -58,41 +64,93 @@ ARG GO_BUILD_TAGS=$GO_BUILD_TAGS
 RUN --mount=target=.,id=dexfile-app-src \
     --mount=type=cache,target=/root/.cache,sharing=shared,id=dexfile-root-cache \
     --mount=type=cache,target=/go/pkg/mod,sharing=shared,id=dexfile-mod-cache \
-    set -euo pipefail && \
-    echo "Trying build from GO_ENTRYPOINT=$GO_ENTRYPOINT" && \
-    if CGO_ENABLED=0 go build \
-        -ldflags="$GO_LD_FLAGS" \
-        -tags "$GO_BUILD_TAGS" \
-        -o "$GO_OUTPUT_BIN_PATH" \
-        "$GO_ENTRYPOINT"; then \
-        echo "Build succeeded from GO_ENTRYPOINT"; \
-    else \
-        echo "Build from GO_ENTRYPOINT failed, detecting main package dynamically..." >&2 && \
-        MAIN_DIRS=$(find . -type f -maxdepth 5 -name '*.go' \
-            ! -name '*_test.go' \
-            ! -path './vendor/*' \
-            -exec grep -q '^package main' {} \; \
-            -exec grep -q '^func main\s*(' {} \; \
-            -print \
-            | xargs -r -n1 dirname | sort -u) && \
-        COUNT=$(echo "$MAIN_DIRS" | grep -c . || true) && \
-        if [ "$COUNT" -eq 0 ]; then \
-            echo "No main package found, build failed" >&2 && exit 1; \
-        elif [ "$COUNT" -gt 1 ]; then \
-            echo "Error: multiple main package directories found:" >&2 && \
-            echo "$MAIN_DIRS" >&2 && \
-            echo "Please set GO_ENTRYPOINT explicitly via build args." >&2 && \
-            exit 1; \
-        else \
-            MAIN_DIR=$(echo "$MAIN_DIRS") && \
-            echo "Detected main dir: $MAIN_DIR" && \
-            CGO_ENABLED=0 go build \
-                -ldflags="$GO_LD_FLAGS" \
-                -tags "$GO_BUILD_TAGS" \
-                -o "$GO_OUTPUT_BIN_PATH" \
-                "$MAIN_DIR"; \
-        fi; \
+    <<EOF
+#!/bin/sh
+set -e
+
+# 1. Validation of Meta ARGs
+: "\${GO_OUTPUT_BIN_PATH?Error: GO_OUTPUT_BIN_PATH must be set}"
+
+# 2. Dependencies
+if [ -f go.mod ]; then
+    case \${GOFLAGS:-} in (*-mod=vendor*) ;; *) go mod download >/dev/null 2>&1 || true ;; esac
+fi
+
+# 3. Build function
+build_pkg() {
+    _p="\$1" _o="\$2"
+    env CGO_ENABLED=0 \
+        \${GOOS:+GOOS="\$GOOS"} \
+        \${GOARCH:+GOARCH="\$GOARCH"} \
+        go build -trimpath \
+        -ldflags="\${GO_LD_FLAGS:+\$GO_LD_FLAGS }-buildid=" \
+        \${GO_BUILD_TAGS:+-tags="\$GO_BUILD_TAGS"} \
+        -o "\$_o" "\$_p"
+}
+
+# 4. Detection
+M=""
+
+# 4.1 Check GO_ENTRYPOINT first
+if [ -n "\${GO_ENTRYPOINT:-}" ]; then
+    build_pkg "\${GO_ENTRYPOINT}" "\${GO_OUTPUT_BIN_PATH}" && exit 0
+fi
+
+# 4.2 Check GO_MAIN_GLOB
+if [ -n "\${GO_MAIN_GLOB:-}" ]; then
+    set -f; set -- \${GO_MAIN_GLOB}; set +f
+    for d; do [ -d "\$d" ] && M="\$M\${M:+ }\$d"; done
+fi
+
+# 4.3 Fallback to Makefile / Justfile / Taskfile if no main packages yet
+if [ -z "\$M" ]; then
+    if [ "${MAKE_ENABLED:-1}" -eq 1 ] && [ -f Makefile ]; then
+        make "${MAKE_TARGET:-build}" && exit 0
+    elif [ "${JUST_ENABLED:-0}" -eq 1 ] && [ -f Justfile ]; then
+        just "${JUST_TARGET:-build}" && exit 0
+    elif [ "${TASK_ENABLED:-0}" -eq 1 ] && [ -f Taskfile.yml ]; then
+        task "${TASK_TARGET:-build}" && exit 0
     fi
+fi
+
+# 4.4 If still nothing, try go.mod detection
+if [ -z "\$M" ] && [ -f go.mod ]; then
+    M=\$(go list \${GO_BUILD_TAGS:+-tags="\$GO_BUILD_TAGS"} -f '{{if eq .Name "main"}}{{.Dir}}{{end}}' ./... 2>/dev/null || true)
+fi
+
+# 4.5 Final check: fail if still no main packages
+if [ -z "\$M" ]; then
+    echo "No main packages found" >&2
+    exit 1
+fi
+
+# 5. Execution Loop
+_OIFS=\$IFS; IFS=' '
+if [ -n "\$CROSS_MATRIX" ]; then
+    _B_OUT="\${GO_OUTPUT_BIN_PATH}"
+    _M_IFS=\$IFS; IFS=','; set -f; set -- \$CROSS_MATRIX; set +f; IFS=\$_M_IFS
+    for c; do
+        export GOOS="\${c%%/*}" GOARCH="\${c##*/}"
+        MDIR="\$_B_OUT/\${GOOS}_\${GOARCH}"
+        mkdir -p "\$MDIR"
+        set -f; set -- \$M; set +f
+        for p; do
+            bin="\${p##*/}"; [ "\$GOOS" = windows ] && bin="\$bin.exe"
+            tout="\$MDIR"; [ "\${GO_MULTI_BIN:-0}" = 1 ] && tout="\$MDIR/\$bin"
+            build_pkg "\$p" "\$tout"
+        done
+    done
+else
+    [ "\${GO_MULTI_BIN:-0}" -eq 1 ] && mkdir -p "\${GO_OUTPUT_BIN_PATH}"
+    set -f; set -- \$M; set +f
+    for p; do
+        tout="\${GO_OUTPUT_BIN_PATH}"
+        [ "\${GO_MULTI_BIN:-0}" -eq 1 ] && tout="\${GO_OUTPUT_BIN_PATH}/\${p##*/}"
+        build_pkg "\$p" "\$tout"
+    done
+fi
+IFS=\$_OIFS
+EOF
 
 FROM ${RUN_IMAGE:-alpine:latest} AS prod
 WORKDIR /home/dexfile/app
