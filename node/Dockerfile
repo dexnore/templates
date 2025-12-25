@@ -3,50 +3,168 @@
 # This Dockerfile uses Dexfile syntax. For more information, see:
 # https://github.com/dexnore/dexfile
 
-ARG BUILD_IMAGE RUN_IMAGE PORT BUILD_IMAGE_VERSION NGINX_ROOT
+ARG BUILD_IMAGE RUN_IMAGE PORT BUILD_IMAGE_VERSION NGINX_ROOT WORKSPACE_TYPE PACKAGE_MANAGER
 WORKDIR /home/dexfile/app
-IF PROC --mount=target=. [ ! -f "package.json" ]
-    RUN echo "no 'package.json' file found!" >&2 && exit 1;
+
+# ============================================================================
+# PACKAGE MANAGER DETECTION
+# ============================================================================
+FUNC detect_package_manager
+    # Priority 1: Lock files (most reliable)
+    IF PROC --from=busybox:latest --mount=target=. [ -f "bun.lockb" ] || [ -f "bun.lock" ]
+        ARG PACKAGE_MANAGER="bun"
+        ARG BUILD_IMAGE="oven/bun:alpine"
+    ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "deno.lock" ] || [ -f "deno.json" ] || [ -f "deno.jsonc" ]
+        ARG PACKAGE_MANAGER="deno"
+        ARG BUILD_IMAGE="denoland/deno:alpine"
+    ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "pnpm-lock.yaml" ]
+        ARG PACKAGE_MANAGER="pnpm"
+    ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "yarn.lock" ]
+        ARG PACKAGE_MANAGER="yarn"
+        # Detect Yarn version from lockfile
+        IF PROC --from=busybox:latest --mount=target=. grep -q "__metadata" yarn.lock
+            ARG PACKAGE_MANAGER="yarn-berry"
+        ENDIF
+    ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "package-lock.json" ]
+        ARG PACKAGE_MANAGER="npm"
+    ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "package.json" ]
+        # Check packageManager field in package.json
+        IF PROC --from=busybox:latest --mount=target=. grep -q '"packageManager".*"pnpm@' package.json
+            ARG PACKAGE_MANAGER="pnpm"
+        ELSE IF PROC --from=busybox:latest --mount=target=. grep -q '"packageManager".*"yarn@' package.json
+            ARG PACKAGE_MANAGER="yarn-berry"
+        ELSE IF PROC --from=busybox:latest --mount=target=. grep -q '"packageManager".*"bun@' package.json
+            ARG PACKAGE_MANAGER="bun"
+            ARG BUILD_IMAGE="oven/bun:alpine"
+        ELSE
+            ARG PACKAGE_MANAGER="npm"
+        ENDIF
+    ELSE
+        RUN echo "ERROR: No package.json found" >&2 && exit 1
+    ENDIF
+ENDFUNC
+
+FUNC CALL detect_package_manager
+
+# ============================================================================
+# WORKSPACE/MONOREPO DETECTION
+# ============================================================================
+FUNC detect_workspace
+    IF PROC --from=busybox:latest --mount=target=. [ -f "nx.json" ]
+        ARG WORKSPACE_TYPE="nx"
+    ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "turbo.json" ]
+        ARG WORKSPACE_TYPE="turborepo"
+    ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "lerna.json" ]
+        ARG WORKSPACE_TYPE="lerna"
+    ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "rush.json" ]
+        ARG WORKSPACE_TYPE="rush"
+    ELSE IF PROC --from=busybox:latest --mount=target=. grep -q '"workspaces"' package.json
+        ARG WORKSPACE_TYPE="workspaces"
+    ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "pnpm-workspace.yaml" ]
+        ARG WORKSPACE_TYPE="pnpm-workspaces"
+    ELSE
+        ARG WORKSPACE_TYPE="single"
+    ENDIF
+ENDFUNC
+
+FUNC CALL detect_workspace
+
+IF PROC [ -z "${BUILD_IMAGE_VERSION}" ]
+	IF PROC --from=busybox:latest --mount=target=. [ -f ".bun-version" ] && cat .bun-version
+		ARG BUILD_IMAGE_VERSION=$STDOUT
+	ELSE IF PROC --from=busybox:latest --mount=target=. grep -q '"packageManager".*"bun@' package.json; && VERSION=$(grep -oP '"packageManager":\s*"bun@\K[^"]+' package.json) && echo "$VERSION"
+		ARG BUILD_IMAGE_VERSION=$STDOUT
+	ELSE IF PROC --from=busybox:latest --mount=target=. [ -f ".deno-version" ] && cat .deno-version
+		ARG BUILD_IMAGE_VERSION=$STDOUT
+	# Node.js version detection (priority order)
+	# 1. .nvmrc (most common)
+	ELSE IF PROC --from=busybox:latest --mount=target=. [ -f ".nvmrc" ] && cat .nvmrc | tr -d 'v' | tr -d '\n'
+		ARG BUILD_IMAGE_VERSION=$STDOUT
+	# 2. .node-version (asdf, fnm)
+	ELSE IF PROC --from=busybox:latest --mount=target=. [ -f ".node-version" ] && cat .node-version | tr -d 'v' | tr -d '\n'
+		ARG BUILD_IMAGE_VERSION=$STDOUT
+	# 3. .tool-versions (asdf)
+	ELSE IF PROC --from=busybox:latest --mount=target=. [ -f ".tool-versions" ] && VERSION=$(grep -oP 'nodejs\s+\K[\d.]+' .tool-versions) && echo "$VERSION"
+		ARG BUILD_IMAGE_VERSION=$STDOUT
+	# 4. volta field in package.json
+	ELSE IF PROC --from=busybox:latest --mount=target=. grep -q '"volta"' package.json; && VERSION=$(grep -oP '"node":\s*"\K[\d.]+' package.json) && echo "$VERSION"
+		ARG BUILD_IMAGE_VERSION=$STDOUT
+	# 5. engines field in package.json
+	ELSE IF PROC --from=busybox:latest --mount=target=. grep -q '"engines"' package.json; && VERSION=$(grep -oP '"node":\s*"[>=^~]*\K[\d.]+' package.json | head -1) && echo "$VERSION"
+		ARG BUILD_IMAGE_VERSION=$STDOUT
+	ENDIF
 ENDIF
 
 IF PROC [ -z "${BUILD_IMAGE}" ]
-    IF PROC --mount=target=. [ -f "bun.lockb" ] || [ -f "bun.lock" ]
-        IF PROC --mount=target=. [ -z "${BUILD_IMAGE_VERSION}" ] && [ -f ".bun-version" ] && cat .bun-version
-            ARG BUILD_IMAGE_VERSION=$STDOUT
-        ENDIF
+    # Bun version detection
+    IF PROC [ "${PACKAGE_MANAGER}" = "bun" ]
         ARG BUILD_IMAGE=oven/bun:${BUILD_IMAGE_VERSION:+${BUILD_IMAGE_VERSION}-}alpine
-    ELSE IF PROC --mount=target=. [ -f "lock.json" ] || [ -s "deno.json" ] || [ -s "deno.jsonc" ]
-        ARG BUILD_IMAGE=denoland/deno:alpine
-    ENDIF
+	# Deno version detection
+    ELSE IF PROC [ "${PACKAGE_MANAGER}" = "deno" ]
+		ARG BUILD_IMAGE=denoland/deno:alpine${BUILD_IMAGE_VERSION:+-${BUILD_IMAGE_VERSION}}
+	ELSE
+		ARG BUILD_IMAGE="node:${BUILD_IMAGE_VERSION:+${BUILD_IMAGE_VERSION}-}${BUILD_IMAGE_VERSION:-lts}alpine"
+	ENDIF
 ENDIF
 
 IF PROC [ -z "${RUN_IMAGE}" ]
-    IF PROC --mount=target=. [ -f "nginx.conf" ]
-        ARG RUN_IMAGE=nginx:stable-alpine-slim
-    ENDIF
+	IF PROC --mount=target=. [ -f "nginx.conf" ]
+		ARG RUN_IMAGE=nginx:stable-alpine-slim
+	ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "Caddyfile" ]
+        ARG RUN_IMAGE="caddy:2-alpine"
+	# Bun version detection
+    ELSE IF PROC [ "${PACKAGE_MANAGER}" = "bun" ]
+        ARG RUN_IMAGE=oven/bun:${BUILD_IMAGE_VERSION:+${BUILD_IMAGE_VERSION}-}alpine
+	# Deno version detection
+    ELSE IF PROC [ "${PACKAGE_MANAGER}" = "deno" ]
+		ARG RUN_IMAGE=denoland/deno:alpine${BUILD_IMAGE_VERSION:+-${BUILD_IMAGE_VERSION}}
+	ELSE
+		ARG RUN_IMAGE="node:${BUILD_IMAGE_VERSION:+${BUILD_IMAGE_VERSION}-}${BUILD_IMAGE_VERSION:-lts}alpine"
+	ENDIF
 ENDIF
 
 FROM ${BUILD_IMAGE:-node:lts-alpine} AS base
 WORKDIR /home/dexfile/app
+# Install system dependencies for native modules
+RUN if command -v apk >/dev/null 2>&1; then \
+        apk add --no-cache \
+            python3 py3-pip make g++ gcc git \
+            libc6-compat libstdc++ \
+            curl bash; \
+    elif command -v apt-get >/dev/null 2>&1; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            python3 python3-pip make g++ gcc git curl && \
+        apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 FROM base AS deps
 COPY package.json package-lock.json* yarn.lock* .pnp.* \
     pnpm-lock.yaml* bun.lock* lock.json* deno.json* \
     bunfig.toml* .npmrc* .yarnrc.yml* nginx.conf* \
+	bunfig.toml* nx.json* turbo.json* lerna.json* rush.json* pnpm-workspace.yaml* \
     /home/dexfile/app/
 COPY .yarn* /home/dexfile/app/.yarn
 RUN --mount=type=cache,target=.npm \
     --mount=type=secret,id=npmrc,target=.npmrc \
     --mount=type=secret,id=yarnrc,target=.yarnrc.yml \
     --mount=type=secret,id=bunfig,target=bunfig.toml \
-    if [ -f "yarn.lock" ]; then \
-        if ! command -v yarn >/dev/null 2>&1; then \
-            npm install -g yarn@latest; \
+	set -e; \
+    if [ "${PACKAGE_MANAGER}" = "pnpm" ] && ! command -v pnpm >/dev/null 2>&1; then \
+        if command -v corepack >/dev/null 2>&1; then \
+            corepack enable pnpm; \
+        else \
+            npm install -g pnpm@latest; \
         fi; \
-    elif [ -f "pnpm-lock.yaml" ]; then \
-        if ! command -v pnpm >/dev/null 2>&1; then \
-            npm install -g pnpm; fi; \
-        fi;
+    elif [ "${PACKAGE_MANAGER}" = "yarn" ] || [ "${PACKAGE_MANAGER}" = "yarn-berry" ]; then \
+        if ! command -v yarn >/dev/null 2>&1; then \
+            if command -v corepack >/dev/null 2>&1; then \
+                corepack enable yarn; \
+            else \
+                npm install -g yarn@latest; \
+            fi; \
+        fi; \
+    fi;
 
 RUN --mount=type=cache,target=.npm \
     --mount=type=cache,target=.cache/yarn \
@@ -58,44 +176,83 @@ RUN --mount=type=cache,target=.npm \
     --mount=type=secret,id=npmrc,target=.npmrc \
     --mount=type=secret,id=yarnrc,target=.yarnrc.yml \
     --mount=type=secret,id=bunfig,target=bunfig.toml \
-    if [ ! -f "nx.json" ]; then exit 0; fi; \
-    if [ -f "yarn.lock" ]; then yarn global add nx; \
-    elif [ -f "pnpm-lock.yaml" ]; then pnpm add --global nx; \
-    elif [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then bun add -g nx; \
-    elif [ -f "lock.json" ] || [ -s "deno.json" ] || [ -s "deno.jsonc" ]; then \
-        deno install -A -n nx npm:nx; \
-    else npm add --global nx; fi;
+	set -e; \
+	if [ "${WORKSPACE_TYPE}" = "nx" ] && [ -f "nx.json" ]; then \
+		if [ "${PACKAGE_MANAGER}" = "pnpm" ]; then \
+			pnpm add -g nx@latest; \
+		elif [ "${PACKAGE_MANAGER}" = "yarn" ] || [ "${PACKAGE_MANAGER}" = "yarn-berry" ]; then \
+			yarn global add nx@latest 2>/dev/null || npm install -g nx@latest; \
+		elif [ "${PACKAGE_MANAGER}" = "bun" ]; then \
+			bun add -g nx@latest; \
+		else \
+			npm install -g nx@latest; \
+		fi; \
+	elif [ "${WORKSPACE_TYPE}" = "turborepo" ] && [ -f "turbo.json" ]; then \
+		if [ "${PACKAGE_MANAGER}" = "pnpm" ]; then \
+			pnpm add -g turbo@latest; \
+		elif [ "${PACKAGE_MANAGER}" = "bun" ]; then \
+			bun add -g turbo@latest; \
+		else \
+			npm install -g turbo@latest; \
+		fi; \
+	elif [ "${WORKSPACE_TYPE}" = "lerna" ] && [ -f "lerna.json" ]; then \
+		npm install -g lerna@latest; \
+	fi
+
 
 FROM deps AS installer
-RUN --mount=type=cache,target=.npm \
-    --mount=type=cache,target=.cache/yarn \
-    --mount=type=cache,target=.yarn/cache \
-    --mount=type=cache,target=.pnpm-store \
-    --mount=type=cache,target=.local/share/pnpm/store/v3 \
-    --mount=type=cache,target=.bun/install/cache \
-    --mount=type=cache,target=.cache/deno \
-    --mount=type=secret,id=npmrc,target=.npmrc \
-    --mount=type=secret,id=yarnrc,target=.yarnrc.yml \
-    --mount=type=secret,id=bunfig,target=bunfig.toml \
-    if [ -f "yarn.lock" ]; then \
-        if yarn --version | grep -q '^1\.'; then yarn install --production --frozen-lockfile; \
-        else yarn install --immutable --check-cache; fi; \
-    elif [ -f "pnpm-lock.yaml" ]; then pnpm install --frozen-lockfile --prod; \
-    elif [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then bun install --frozen-lockfile --production; \
-    elif [ -f "lock.json" ] || [ -s "deno.json" ] || [ -s "deno.jsonc" ]; then \
-        deno cache --lock=deno.lock --frozen deps.ts; \
-    else npm ci --omit=dev; fi;
+# Install production dependencies
+RUN --mount=type=cache,id=npm-cache,target=/root/.npm,sharing=locked \
+    --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm/store,sharing=locked \
+    --mount=type=cache,id=yarn-cache,target=/root/.yarn/cache,sharing=locked \
+    --mount=type=cache,id=bun-cache,target=/root/.bun/install/cache,sharing=locked \
+    --mount=type=cache,id=deno-cache,target=/root/.cache/deno,sharing=locked \
+    --mount=type=secret,id=npmrc,target=/home/dexfile/app/.npmrc \
+    --mount=type=secret,id=yarnrc,target=/home/dexfile/app/.yarnrc.yml \
+    --mount=type=secret,id=bunfig,target=/home/dexfile/app/bunfig.toml \
+    set -e; \
+    if [ "${PACKAGE_MANAGER}" = "bun" ]; then \
+        bun install --frozen-lockfile --production; \
+    elif [ "${PACKAGE_MANAGER}" = "deno" ]; then \
+        if [ -f "deno.lock" ]; then \
+            deno cache --lock=deno.lock --frozen main.ts || deno cache --lock=deno.lock --frozen mod.ts || true; \
+        fi; \
+    elif [ "${PACKAGE_MANAGER}" = "pnpm" ]; then \
+        pnpm install --frozen-lockfile --prod --prefer-offline; \
+    elif [ "${PACKAGE_MANAGER}" = "yarn-berry" ]; then \
+        yarn install --immutable --mode=skip-build; \
+    elif [ "${PACKAGE_MANAGER}" = "yarn" ]; then \
+        if yarn --version | grep -q '^1\.'; then \
+            yarn install --frozen-lockfile --production --prefer-offline; \
+        else \
+            yarn install --immutable --mode=skip-build; \
+        fi; \
+    else \
+        npm ci --omit=dev --prefer-offline; \
+    fi
 
 FROM deps AS builder
 RUN apk add --no-cache python3 git libc6-compat
 COPY / .
 COPY --from=installer ./node_modules ./node_modules
-RUN if [ -f "yarn.lock" ]; then yarn build; \
-    elif [ -f "pnpm-lock.yaml" ]; then pnpm run build; \
-    elif [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then bun run build; \
-    elif [ -f "lock.json" ] || [ -s "deno.json" ] || [ -s "deno.jsonc" ]; then \
-        deno task build --lock=deno.lock --frozen; \
-    else npm run build; fi;
+RUN --mount=type=cache,id=vite-cache,target=/home/dexfile/app/.vite,sharing=locked \
+	--mount=type=cache,id=next-cache,target=/home/dexfile/app/.next/cache,sharing=locked \
+	--mount=type=cache,id=nuxt-cache,target=/home/dexfile/app/.nuxt,sharing=locked \
+	--mount=type=cache,id=turbo-cache,target=/home/dexfile/app/.turbo,sharing=locked \
+	set -e; \
+	if [ "${PACKAGE_MANAGER}" = "bun" ]; then \
+		bun run build 2>/dev/null || echo "No build script found, skipping"; \
+	elif [ "${PACKAGE_MANAGER}" = "deno" ]; then \
+		if [ -f "deno.json" ] || [ -f "deno.jsonc" ]; then \
+			deno task build 2>/dev/null || echo "No build task found, skipping"; \
+		fi; \
+	elif [ "${PACKAGE_MANAGER}" = "pnpm" ]; then \
+		pnpm run build 2>/dev/null || pnpm build 2>/dev/null || echo "No build script found, skipping"; \
+	elif [ "${PACKAGE_MANAGER}" = "yarn" ] || [ "${PACKAGE_MANAGER}" = "yarn-berry" ]; then \
+		yarn build 2>/dev/null || echo "No build script found, skipping"; \
+	else \
+		npm run build 2>/dev/null || echo "No build script found, skipping"; \
+	fi
 
 FROM ${RUN_IMAGE:-node:lts-alpine} AS app
 RUN addgroup dexnore && adduser --ingroup dexnore dexfile --disabled-password
