@@ -260,7 +260,6 @@ WORKDIR /home/dexfile/app
 USER dexfile:dexnore
 
 FROM app AS prod
-COPY --chown=root:root nginx.conf* /etc/nginx/conf.d/default.conf
 RUN cat <<'EOF' > /usr/local/bin/nginx_custom_script.sh
 #!/usr/bin/env bash
 set -euo pipefail
@@ -407,36 +406,157 @@ IF RUN /usr/local/bin/nginx_custom_script.sh root nginx.conf && [ -z "${NGINX_RO
     ARG NGINX_ROOT=${STDOUT:-/usr/share/nginx/html}
 ENDIF
 
-IF PROC --mount=target=. [ -f "nx.json" ] && [ ! -f "nginx.conf" ]
-    COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dist/apps/* /home/dexfile/app/
-ELSE IF PROC --mount=target=. [ ! -f "nx.json" ] && [ ! -f "nginx.conf" ]
-    COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app /home/dexfile/app
-ELSE IF PROC --mount=target=. [ ! -f "nx.json" ] && [ -f "nginx.conf" ]
-    COPY --chown=root:root --from=builder /home/dexfile/app/* ${NGINX_ROOT}
+IF PROC [ -n "${RUN_IMAGE}" ] && (echo "${RUN_IMAGE}" | grep -q "nginx\|caddy")
+	# Copy nginx/Caddy config
+	IF PROC --from=busybox:latest --mount=target=. [ -f "nginx.conf" ]
+		COPY --chown=root:root nginx.conf /etc/nginx/conf.d/default.conf
+	ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "Caddyfile" ]
+		COPY --chown=root:root Caddyfile /etc/caddy/Caddyfile
+	ENDIF
 ELSE
-    COPY --chown=root:root --from=builder /home/dexfile/app/dist/apps/* ${NGINX_ROOT}
+	# Copy production dependencies
+    COPY --chown=dexfile:dexnore --from=deps /home/dexfile/app/node_modules* ./
+    COPY --chown=dexfile:dexnore --from=deps /home/dexfile/app/.pnp.* ./
+    COPY --chown=dexfile:dexnore --from=deps /home/dexfile/app/.yarn* ./
+    
+    # Copy package.json
+    COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/package.json ./package.json
+
+	# Copy built static files based on framework
+    IF PROC [ "${WORKSPACE_TYPE}" = "nx" ]
+        COPY --chown=nginx:nginx --from=builder /home/dexfile/app/dist/apps ${NGINX_ROOT}/
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "nextjs" ]
+        COPY --chown=nginx:nginx --from=builder /home/dexfile/app/out ${NGINX_ROOT}/
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "nuxt" ]
+        COPY --chown=nginx:nginx --from=builder /home/dexfile/app/.output/public ${NGINX_ROOT}/
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "astro" ]
+        COPY --chown=nginx:nginx --from=builder /home/dexfile/app/dist ${NGINX_ROOT}/
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "sveltekit" ]
+        COPY --chown=nginx:nginx --from=builder /home/dexfile/app/build ${NGINX_ROOT}/
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "angular" ]
+        COPY --chown=nginx:nginx --from=builder /home/dexfile/app/dist ${NGINX_ROOT}/
+    ELSE
+        # Generic: try common output directories
+        COPY --chown=nginx:nginx --from=builder /home/dexfile/app/dist* ${NGINX_ROOT}/
+		COPY --chown=nginx:nginx --from=builder /home/dexfile/app/build* ${NGINX_ROOT}/
+		COPY --chown=nginx:nginx --from=builder /home/dexfile/app/public* ${NGINX_ROOT}/
+		COPY --chown=nginx:nginx --from=builder /home/dexfile/app/out* ${NGINX_ROOT}/
+    ENDIF
+
+	# Set proper permissions
+    RUN chown -R nginx:nginx ${NGINX_ROOT} && chmod -R 755 ${NGINX_ROOT}
+
+	# Start web server
+    IF PROC echo "${RUN_IMAGE}" | grep -q "nginx"
+        CMD ["nginx", "-g", "daemon off;"]
+    ELSE
+        CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile"]
+    ENDIF
+
+
+	# Copy built application based on framework
+    IF PROC [ "${WORKSPACE_TYPE}" = "nx" ]
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dist ./dist
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "nextjs" ]
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/.next* ./
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/public* ./
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/next.config.* ./
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "nuxt" ]
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/.output* ./
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "remix" ]
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/build* ./
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/public* ./
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "astro" ]
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dist* ./
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "sveltekit" ]
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/build* ./
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "angular" ]
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dist* ./
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "nestjs" ]
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dist* ./
+    ELSE
+        # Generic: copy common output directories
+		COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dist* ./
+		COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/build* ./
+		COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app .
+    ENDIF
+    
+    # Framework-specific health checks
+    IF PROC [ "${FRAMEWORK_TYPE}" = "nextjs" ]
+        HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+            CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:${PORT}/api/health 2>/dev/null || \
+                wget --no-verbose --tries=1 --spider http://127.0.0.1:${PORT}/ || exit 1
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "nestjs" ]
+        HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+            CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:${PORT}/health 2>/dev/null || exit 1
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "fastify" ] || [ "${FRAMEWORK_TYPE}" = "express" ]
+        HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+            CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:${PORT}/health 2>/dev/null || \
+                wget --no-verbose --tries=1 --spider http://127.0.0.1:${PORT}/ || exit 1
+    ENDIF
+    
+    # Set appropriate entrypoint based on framework and package manager
+    IF PROC [ "${FRAMEWORK_TYPE}" = "nextjs" ]
+        CMD ["node", "server.js"]
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "nuxt" ]
+        CMD ["node", ".output/server/index.mjs"]
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "remix" ]
+        IF PROC [ "${PACKAGE_MANAGER}" = "bun" ]
+            CMD ["bun", "run", "start"]
+        ELSE IF PROC [ "${PACKAGE_MANAGER}" = "pnpm" ]
+            CMD ["pnpm", "start"]
+        ELSE IF PROC [ "${PACKAGE_MANAGER}" = "yarn" ] || [ "${PACKAGE_MANAGER}" = "yarn-berry" ]
+            CMD ["yarn", "start"]
+        ELSE
+            CMD ["npm", "start"]
+        ENDIF
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "nestjs" ]
+        CMD ["node", "dist/main"]
+    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "astro" ]
+        CMD ["node", "./dist/server/entry.mjs"]
+    ELSE IF PROC [ "${PACKAGE_MANAGER}" = "bun" ]
+        CMD ["bun", "run", "start"]
+    ELSE IF PROC [ "${PACKAGE_MANAGER}" = "deno" ]
+        CMD ["deno", "task", "start"]
+    ELSE IF PROC [ "${PACKAGE_MANAGER}" = "pnpm" ]
+        CMD ["pnpm", "start"]
+    ELSE IF PROC [ "${PACKAGE_MANAGER}" = "yarn" ] || [ "${PACKAGE_MANAGER}" = "yarn-berry" ]
+        CMD ["yarn", "start"]
+    ELSE
+        CMD ["npm", "start"]
+    ENDIF
 ENDIF
 
-RUN cat <<'EOF' > /usr/local/bin/entrypoint.sh
-#!/bin/sh
+# IF PROC --mount=target=. [ -f "nx.json" ] && [ ! -f "nginx.conf" ]
+#     COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dist/apps/* /home/dexfile/app/
+# ELSE IF PROC --mount=target=. [ ! -f "nx.json" ] && [ ! -f "nginx.conf" ]
+#     COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app /home/dexfile/app
+# ELSE IF PROC --mount=target=. [ ! -f "nx.json" ] && [ -f "nginx.conf" ]
+#     COPY --chown=root:root --from=builder /home/dexfile/app/* ${NGINX_ROOT}
+# ELSE
+#     COPY --chown=root:root --from=builder /home/dexfile/app/dist/apps/* ${NGINX_ROOT}
+# ENDIF
 
-if [ -f "nginx.conf" ]; then
-exec nginx -g "daemon off;"
-elif [ -f "deno.json" ] || [ -f "deno.jsonc" ] || [ -f "lock.json" ]; then
-exec deno task start
-elif [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then
-exec bun run start
-elif [ -f "yarn.lock" ]; then
-exec yarn start
-elif [ -f "pnpm-lock.yaml" ]; then
-exec pnpm start
-else
-exec npm run start
-fi
-EOF
+# RUN cat <<'EOF' > /usr/local/bin/entrypoint.sh
+# #!/bin/sh
 
-RUN chmod +x /usr/local/bin/entrypoint.sh
-CMD [ "/usr/local/bin/entrypoint.sh" ]
+# if [ -f "nginx.conf" ]; then
+# exec nginx -g "daemon off;"
+# elif [ -f "deno.json" ] || [ -f "deno.jsonc" ] || [ -f "lock.json" ]; then
+# exec deno task start
+# elif [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then
+# exec bun run start
+# elif [ -f "yarn.lock" ]; then
+# exec yarn start
+# elif [ -f "pnpm-lock.yaml" ]; then
+# exec pnpm start
+# else
+# exec npm run start
+# fi
+# EOF
+
+# RUN chmod +x /usr/local/bin/entrypoint.sh
+# CMD [ "/usr/local/bin/entrypoint.sh" ]
 
 FROM prod AS release
 EXPOSE ${PORT:-3000}
