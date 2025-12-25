@@ -527,41 +527,23 @@ ELSE
     ENDIF
 ENDIF
 
-# IF PROC --mount=target=. [ -f "nx.json" ] && [ ! -f "nginx.conf" ]
-#     COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dist/apps/* /home/dexfile/app/
-# ELSE IF PROC --mount=target=. [ ! -f "nx.json" ] && [ ! -f "nginx.conf" ]
-#     COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app /home/dexfile/app
-# ELSE IF PROC --mount=target=. [ ! -f "nx.json" ] && [ -f "nginx.conf" ]
-#     COPY --chown=root:root --from=builder /home/dexfile/app/* ${NGINX_ROOT}
-# ELSE
-#     COPY --chown=root:root --from=builder /home/dexfile/app/dist/apps/* ${NGINX_ROOT}
-# ENDIF
-
-# RUN cat <<'EOF' > /usr/local/bin/entrypoint.sh
-# #!/bin/sh
-
-# if [ -f "nginx.conf" ]; then
-# exec nginx -g "daemon off;"
-# elif [ -f "deno.json" ] || [ -f "deno.jsonc" ] || [ -f "lock.json" ]; then
-# exec deno task start
-# elif [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then
-# exec bun run start
-# elif [ -f "yarn.lock" ]; then
-# exec yarn start
-# elif [ -f "pnpm-lock.yaml" ]; then
-# exec pnpm start
-# else
-# exec npm run start
-# fi
-# EOF
-
-# RUN chmod +x /usr/local/bin/entrypoint.sh
-# CMD [ "/usr/local/bin/entrypoint.sh" ]
-
 FROM prod AS release
 EXPOSE ${PORT:-3000}
+
+# Metadata labels
 LABEL maintainer="@dexnore/dexfile"
+LABEL org.opencontainers.image.vendor="Dexnore"
+LABEL org.opencontainers.image.title="Node.js Application"
+LABEL org.opencontainers.image.description="Production Node.js application supporting multiple runtimes, frameworks, and build tools"
+LABEL org.opencontainers.image.authors="@dexnore/dexfile"
 LABEL moby.buildkit.frontend.network.none="true"
 LABEL moby.buildkit.frontend.caps="moby.buildkit.frontend.inputs,moby.buildkit.frontend.subrequests,moby.buildkit.frontend.contexts"
+
+# Dynamic labels based on detection
+LABEL app.runtime="${PACKAGE_MANAGER}"
+LABEL app.framework="${FRAMEWORK_TYPE}"
+LABEL app.build-tool="${BUILD_TOOL}"
+LABEL app.workspace="${WORKSPACE_TYPE}"
+LABEL security.non-root="true"
 
 FROM release
