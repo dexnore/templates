@@ -816,13 +816,18 @@ WORKDIR /home/dexfile/app
 
 # Install required build tools for native builds
 IF PROC --from=busybox:latest [ "${BUILD_NATIVE}" = "true" ]
-    RUN if command -v microdnf >/dev/null 2>&1; then \
-            microdnf install -y gcc glibc-devel zlib-devel libstdc++-static; \
-        elif command -v apk >/dev/null 2>&1; then \
-            apk add --no-cache gcc musl-dev zlib-dev zlib-static; \
-        elif command -v apt-get >/dev/null 2>&1; then \
-            apt-get update && apt-get install -y gcc zlib1g-dev; \
-        fi
+    RUN if command -v apt-get >/dev/null 2>&1; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            gcc g++ zlib1g-dev build-essential && \
+        apt-get clean && \
+        rm -rf /var/lib/apt/lists/*; \
+    elif command -v apk >/dev/null 2>&1; then \
+        apk add --no-cache gcc g++ musl-dev zlib-dev zlib-static; \
+    elif command -v microdnf >/dev/null 2>&1; then \
+        microdnf install -y gcc gcc-c++ glibc-devel zlib-devel libstdc++-static && \
+        microdnf clean all; \
+    fi
 ENDIF
 
 # Configure build environment
@@ -833,11 +838,16 @@ ENV MAVEN_CONFIG="/root/.m2"
 
 # Security: Run vulnerability scanning and dependency checks
 RUN if command -v apt-get >/dev/null 2>&1; then \
-        apt-get update && apt-get upgrade -y && apt-get clean && rm -rf /var/lib/apt/lists/*; \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            curl wget ca-certificates git unzip && \
+        apt-get clean && \
+        rm -rf /var/lib/apt/lists/*; \
     elif command -v apk >/dev/null 2>&1; then \
-        apk upgrade --no-cache; \
+        apk add --no-cache curl wget ca-certificates git unzip; \
     elif command -v microdnf >/dev/null 2>&1; then \
-        microdnf upgrade -y && microdnf clean all; \
+        microdnf install -y curl wget ca-certificates git unzip && \
+        microdnf clean all; \
     fi
 
 # ============================================================================
@@ -848,7 +858,7 @@ FROM base AS deps
 # Copy build configuration files
 COPY pom.xml* settings.xml* build.gradle* build.gradle.kts* \
      settings.gradle* settings.gradle.kts* gradle.properties* \
-     build.xml* ivy.xml* ivysettings.xml* \
+     build.xml* ivy.xml* ivysettings.xml* .java-version* .tool-versions* .mvn/jvm.config* \
      mvnw* gradlew* .mvn/ gradle/ /home/dexfile/app/
 
 # Make wrapper scripts executable
@@ -1121,10 +1131,10 @@ EOF
 RUN chmod +x /usr/local/bin/build-deps.sh
 
 # Build the application with framework-specific optimizations
-RUN --mount=type=secret,id=m2settings,target=/home/dexfile/app/settings.xml \
-    --mount=type=cache,id=m2-cache,target=/root/.m2/repository,sharing=locked \
-    --mount=type=cache,id=gradle-cache,target=/root/.gradle,sharing=locked \
-    --mount=type=cache,id=ivy-cache,target=/root/.ivy2,sharing=locked \
+RUN --mount=type=secret,id=m2settings,source=deps,target=/home/dexfile/app/settings.xml \
+    --mount=type=cache,id=m2-cache,source=deps,target=/root/.m2/repository,sharing=locked \
+    --mount=type=cache,id=gradle-cache,source=deps,target=/root/.gradle,sharing=locked \
+    --mount=type=cache,id=ivy-cache,source=deps,target=/root/.ivy2,sharing=locked \
     /usr/local/bin/build-deps.sh
 
 # ============================================================================
@@ -1165,12 +1175,15 @@ EXPOSE ${PORT}
 FROM app AS prod
 
 # Handle GraalVM native executables
-IF PROC --from=builder --mount=target=/build [ -f "/build/home/dexfile/app/dexfile-artifact/app" ] && [ -x "/build/home/dexfile/app/dexfile-artifact/app" ]
-    COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dexfile-artifact/app /home/dexfile/app/app
+IF PROC --from=builder --mount=target=/build [ -f "/build/home/dexfile/app" ] && [ -x "/build/home/dexfile/app" ]
+    COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app /home/dexfile/app/app
+    IF PROC --from=builder [ -d "/home/dexfile/lib/" ]
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/lib/ /home/dexfile/app/libs
+    ENDIF
     IF PROC [ "${DISTRO}" = "distroless" ]
         ENTRYPOINT ["/home/dexfile/app/app"]
     ELSE
-        RUN chmod +x /home/dexfile/app/app
+        RUN chmod +x /home/dexfile/app/app && chmod -R +x /home/dexfile/app/libs
         HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
             CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:${PORT}/q/health 2>/dev/null || \
                 wget --no-verbose --tries=1 --spider http://127.0.0.1:${PORT}/actuator/health 2>/dev/null || \
@@ -1179,37 +1192,37 @@ IF PROC --from=builder --mount=target=/build [ -f "/build/home/dexfile/app/dexfi
     ENDIF
 
 # Handle WAR deployments
-ELSE IF PROC --from=builder --mount=target=/build [ -f "/build/home/dexfile/app/dexfile-artifact/app.war" ]
+ELSE IF PROC --from=builder --mount=target=/build [ -f "/build/home/dexfile/app.war" ]
     # Detect application server type from RUN_IMAGE
     IF PROC echo "${RUN_IMAGE}" | grep -q "tomcat"
-        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dexfile-artifact/app.war /usr/local/tomcat/webapps/ROOT.war
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app.war /usr/local/tomcat/webapps/ROOT.war
         HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
             CMD curl -f http://127.0.0.1:${PORT}/ 2>/dev/null || exit 1
         CMD ["catalina.sh", "run"]
     ELSE IF PROC echo "${RUN_IMAGE}" | grep -q "jetty"
-        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dexfile-artifact/app.war /var/lib/jetty/webapps/ROOT.war
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app.war /var/lib/jetty/webapps/ROOT.war
         HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
             CMD curl -f http://127.0.0.1:${PORT}/ 2>/dev/null || exit 1
         CMD ["java", "-jar", "/usr/local/jetty/start.jar"]
     ELSE IF PROC echo "${RUN_IMAGE}" | grep -q "wildfly"
-        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dexfile-artifact/app.war /opt/jboss/wildfly/standalone/deployments/ROOT.war
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app.war /opt/jboss/wildfly/standalone/deployments/ROOT.war
         HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
             CMD curl -f http://127.0.0.1:${PORT}/ 2>/dev/null || exit 1
         CMD ["/opt/jboss/wildfly/bin/standalone.sh", "-b", "0.0.0.0"]
     ELSE IF PROC echo "${RUN_IMAGE}" | grep -q "glassfish"
-        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dexfile-artifact/app.war /glassfish/domains/domain1/autodeploy/ROOT.war
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app.war /glassfish/domains/domain1/autodeploy/ROOT.war
         HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
             CMD curl -f http://127.0.0.1:${PORT}/ 2>/dev/null || exit 1
         CMD ["asadmin", "start-domain", "-v"]
     ELSE
         # Generic WAR deployment (embedded server in WAR)
-        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dexfile-artifact/app.war /home/dexfile/app/app.war
+        COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app.war /home/dexfile/app/app.war
         ENTRYPOINT ["java", "-jar", "/home/dexfile/app/app.war"]
     ENDIF
 
 # Handle JAR deployments (Spring Boot, Quarkus, Micronaut, etc.)
 ELSE
-    COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app/dexfile-artifact/app.jar /home/dexfile/app/app.jar
+    COPY --chown=dexfile:dexnore --from=builder /home/dexfile/app.jar /home/dexfile/app/app.jar
     
     # Framework-specific health checks
     IF PROC [ "${FRAMEWORK_TYPE}" = "springboot" ]
