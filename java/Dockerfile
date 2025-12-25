@@ -8,552 +8,805 @@ ARG GRADLE_OPTS="-Dorg.gradle.daemon=false -Dorg.gradle.caching=true"
 ARG PORT=8080
 ARG JAVA_ENTRYPOINT MAIN_CLASS JAVA_OPTS CORRETTO_BASE=al2023 \
     APP_NAME LIB_DIR_NAME SKIP_TESTS LOG_LEVEL JAVA_CMD \
-    BUILD_IMAGE RUN_IMAGE BUILD_NATIVE=false JDK_VERSION \
-    JRE_VERSION=21 FRAMEWORK_TYPE DISTRO=temurin MAVEN_VER GRADLE_VER
+    BUILD_IMAGE RUN_IMAGE BUILD_NATIVE JDK_VERSION DISTRO_VARIANT \
+    JRE_VERSION=21 FRAMEWORK_TYPE DISTRO=temurin MAVEN_VER GRADLE_VER \
+    MAVEN_SETTINGS_PATH GRADLE_INIT_PATH REFRESH_DEPENDENCIES NET_RETRIES NET_TIMEOUT \
+    BUILD_PROFILE BUILD_GOAL PARALLELISM OFFLINE
 
 WORKDIR /home/dexfile/app
 
-IF PROC --from=busybox:latest sh -eux <<EOF
-DISTRO="${DISTRO:-temurin}"
-CORRETTO_BASE="${CORRETTO_BASE:-al2023}"
-BUILD_NATIVE="${BUILD_NATIVE:-false}"
-JDK_VERSION="${JDK_VERSION:-}"
-MAVEN_VER="3.9"
-GRADLE_VER="8"
+COPY <<-"EOF" /usr/local/bin/detect-meta.sh
+#!/bin/sh
+# ============================================================================
+# Meta detection script for Java builds
+# Functions:
+#   detect_distro        - Detects base distribution
+#   detect_build_native  - Detects if native build (true/false)
+#   detect_framework     - Detects Java framework type
+#   detect_ant_version   - Detects installed Ant version (if any)
+# ============================================================================
+set -eu
 
-# Detect build file
-BT=""
-for f in pom.xml build.gradle build.gradle.kts build.xml; do
-    if [ -f "$f" ]; then
-        BT="$f"
-        break
-    fi
-done
-
-# Detect Java version from env, version files, or build files
-detect_java_version() {
-    raw="${JDK_VERSION:-}"
-
-    # Check version files
-    if [ -z "$raw" ]; then
-        for f in .java-version .tool-versions gradle.properties; do
-            [ -f "$f" ] || continue
-            case "$f" in
-                .tool-versions)
-                    # BusyBox grep doesn't handle -E well, use multiple calls
-                    line=""
-                    if grep '^java' "$f" >/dev/null 2>&1; then
-                        line=$(grep '^java' "$f" 2>/dev/null)
-                    elif grep '^temurin' "$f" >/dev/null 2>&1; then
-                        line=$(grep '^temurin' "$f" 2>/dev/null)
-                    fi
-                    if [ -n "$line" ]; then
-                        # Use awk to extract second field, tr to keep only numbers/dots
-                        raw=$(echo "$line" | awk '{print $2}' | tr -cd '0-9.')
-                    fi
-                    ;;
-                gradle.properties)
-                    # Check both patterns separately for BusyBox
-                    line=""
-                    if grep 'java\.version=' "$f" >/dev/null 2>&1; then
-                        line=$(grep 'java\.version=' "$f" 2>/dev/null)
-                    elif grep 'javaVersion=' "$f" >/dev/null 2>&1; then
-                        line=$(grep 'javaVersion=' "$f" 2>/dev/null)
-                    fi
-                    if [ -n "$line" ]; then
-                        raw=$(echo "$line" | cut -d= -f2 | tr -cd '0-9.')
-                    fi
-                    ;;
-            esac
-            [ -n "$raw" ] && break
-        done
-    fi
-
-    # Build file fallback
-    if [ -z "$raw" ] && [ -n "$BT" ]; then
-        case "$BT" in
-            pom.xml)
-                # Check each pattern separately
-                line=""
-                if grep '<java\.version>' "$BT" >/dev/null 2>&1; then
-                    line=$(grep '<java\.version>' "$BT" 2>/dev/null | head -n 1)
-                elif grep '<maven\.compiler\.source>' "$BT" >/dev/null 2>&1; then
-                    line=$(grep '<maven\.compiler\.source>' "$BT" 2>/dev/null | head -n 1)
-                elif grep '<maven\.compiler\.target>' "$BT" >/dev/null 2>&1; then
-                    line=$(grep '<maven\.compiler\.target>' "$BT" 2>/dev/null | head -n 1)
-                fi
-                if [ -n "$line" ]; then
-                    # Simple sed extraction for BusyBox
-                    raw=$(echo "$line" | sed 's/.*>\([0-9][0-9.]*\)<.*/\1/' 2>/dev/null || echo "")
-                fi
-                ;;
-            build.gradle|build.gradle.kts)
-                # Case-insensitive search
-                line=""
-                if grep -i 'sourceCompatibility' "$BT" >/dev/null 2>&1; then
-                    line=$(grep -i 'sourceCompatibility' "$BT" 2>/dev/null | head -n 1)
-                elif grep -i 'targetCompatibility' "$BT" >/dev/null 2>&1; then
-                    line=$(grep -i 'targetCompatibility' "$BT" 2>/dev/null | head -n 1)
-                fi
-                if [ -n "$line" ]; then
-                    # Extract numbers only
-                    raw=$(echo "$line" | tr -cd '0-9.')
-                fi
-                ;;
-            build.xml)
-                line=$(grep '<javac' "$BT" 2>/dev/null | head -n 1)
-                if [ -n "$line" ]; then
-                    # Extract source attribute value
-                    for word in $line; do
-                        case "$word" in
-                            source=*)
-                                raw=$(echo "$word" | cut -d= -f2 | tr -d '"' | tr -d "'")
-                                break
-                                ;;
-                        esac
-                    done
-                fi
-                ;;
-        esac
-    fi
-
-    # .mvn/jvm.config fallback
-    if [ -z "$raw" ] && [ -f ".mvn/jvm.config" ]; then
-        line=""
-        if grep '--release' ".mvn/jvm.config" >/dev/null 2>&1; then
-            line=$(grep '--release' ".mvn/jvm.config" 2>/dev/null | head -n 1)
-        elif grep '-source' ".mvn/jvm.config" >/dev/null 2>&1; then
-            line=$(grep '-source' ".mvn/jvm.config" 2>/dev/null | head -n 1)
-        elif grep '-target' ".mvn/jvm.config" >/dev/null 2>&1; then
-            line=$(grep '-target' ".mvn/jvm.config" 2>/dev/null | head -n 1)
-        fi
-        if [ -n "$line" ]; then
-            raw=$(echo "$line" | tr -cd '0-9.')
-        fi
-    fi
-
-    # Normalize 1.8 -> 8, major version only
-    if [ -n "$raw" ]; then
-        case "$raw" in
-            1.*)
-                raw=$(echo "$raw" | cut -c3-)
-                ;;
-        esac
-        # Extract major version (everything before first dot)
-        clean=$(echo "$raw" | cut -d. -f1)
-    else
-        clean=""
-    fi
-    
-    # Default to 17 if empty or invalid
-    case "$clean" in
-        ""|*[!0-9]*)
-            clean="17"
-            ;;
+###############################################################################
+# DISTRO detection (user-overridable)
+###############################################################################
+detect_distro() {
+    case "${DISTRO:-temurin}" in
+        temurin|alpine|corretto|liberica|ubi) ;;
+        *) printf '%s' "temurin"; return ;;
     esac
-
-    printf '%s' "$clean"
+    printf '%s' "${DISTRO:-temurin}"
 }
 
-JAVA_VER=$(detect_java_version)
-
-# Detect build system version (with BusyBox-safe sed)
-if [ -n "$BT" ]; then
-    case "$BT" in
-        pom.xml)
-            if [ -f ".mvn/wrapper/maven-wrapper.properties" ]; then
-                # BusyBox sed might not support -n with p flag well
-                line=$(grep 'distributionUrl' ".mvn/wrapper/maven-wrapper.properties" 2>/dev/null || true)
-                if [ -n "$line" ]; then
-                    # Extract version: ...apache-maven-3.9.6-bin.zip
-                    MAVEN_VER=$(echo "$line" | sed 's/.*maven-//' | sed 's/-bin.*//' | tr -cd '0-9.')
-                fi
-            fi
-            ;;
-        build.gradle|build.gradle.kts)
-            if [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
-                line=$(grep 'distributionUrl' "gradle/wrapper/gradle-wrapper.properties" 2>/dev/null || true)
-                if [ -n "$line" ]; then
-                    GRADLE_VER=$(echo "$line" | sed 's/.*gradle-//' | sed 's/-bin.*//' | tr -cd '0-9.')
-                fi
-            fi
-            ;;
+###############################################################################
+# Native build detection (true/false)
+###############################################################################
+detect_build_native() {
+    case "${BUILD_NATIVE:-false}" in
+        true|false) printf '%s' "${BUILD_NATIVE:-false}" ;;
+        *) printf '%s' "false" ;;
     esac
-fi
+}
 
-# Resolve BUILD_IMAGE
-if [ "$BUILD_NATIVE" = "true" ]; then
-    printf 'ghcr.io/graalvm/native-image-community:%s-ol9\n' "$JAVA_VER"
-    exit 0
-fi
+###############################################################################
+# Framework detection (springboot, quarkus, micronaut, jakartaee, ant, etc.)
+###############################################################################
+detect_framework() {
+    framework="standard"
+    bt_file=""
+    for f in pom.xml build.gradle build.gradle.kts build.xml; do
+        [ -f "$f" ] && { bt_file="$f"; break; }
+    done
 
-case "$BT" in
-    pom.xml)
-        case "$DISTRO" in
-            alpine)   printf 'maven:%s-eclipse-temurin-%s-alpine\n' "$MAVEN_VER" "$JAVA_VER" ;;
-            corretto) printf 'maven:%s-amazoncorretto-%s\n' "$MAVEN_VER" "$JAVA_VER" ;;
-            liberica) printf 'bellsoft/liberica-openjdk-alpine-maven:%s\n' "$JAVA_VER" ;;
-            ubi)      printf 'registry.access.redhat.com/ubi9/openjdk-%s:latest\n' "$JAVA_VER" ;;
-            *)        printf 'maven:%s-eclipse-temurin-%s\n' "$MAVEN_VER" "$JAVA_VER" ;;
+    [ -z "$bt_file" ] && { printf '%s' "$framework"; return; }
+
+    has_dep() { grep -i "$1" "$bt_file" >/dev/null 2>&1; }
+
+    if has_dep 'spring-boot'; then
+        framework="springboot"
+    elif has_dep 'quarkus'; then
+        framework="quarkus"
+    elif has_dep 'micronaut'; then
+        framework="micronaut"
+    elif has_dep 'jakarta.jakartaee-api' || has_dep 'javax.javaee-api'; then
+        framework="jakartaee"
+    elif has_dep 'wildfly' || has_dep 'jboss'; then
+        framework="wildfly"
+    elif has_dep 'glassfish'; then
+        framework="glassfish"
+    elif has_dep 'jetty'; then
+        framework="jetty"
+    elif has_dep 'tomcat'; then
+        framework="tomcat"
+    elif [ "$bt_file" = "build.xml" ]; then
+        framework="ant"
+    fi
+
+    printf '%s' "$framework"
+}
+
+###############################################################################
+# Ant version detection (if installed)
+###############################################################################
+detect_ant_version() {
+    ant -version 2>/dev/null | awk '{print $NF}' | tr -cd '0-9.' || true
+}
+
+###############################################################################
+# POSIX error helper
+###############################################################################
+posix_err() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+
+###############################################################################
+# Main dispatcher
+###############################################################################
+if [ $# -gt 0 ]; then
+    func="$1"; shift
+    # Check if function exists
+    if command -v "$func" >/dev/null 2>&1; then
+        "$func" "$@"
+    else
+        posix_err "Function '$func' not found in this script."
+    fi
+else
+    posix_err "No function specified. Usage: $0 <function_name>"
+fi
+EOF
+
+RUN chmod +x /usr/local/bin/detect-meta.sh
+
+COPY <<-"EOF" /usr/local/bin/detect_java_version.sh
+#!/bin/sh
+# ============================================================================
+# Java Version Detector (Compile-time vs Runtime)
+# User preference is authoritative – NO normalization
+# POSIX / BusyBox safe
+# ============================================================================
+
+set -eu
+
+posix_err() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+strip_java_version() {
+    # Converts 1.8.0_362 → 8, 17.0.1 → 17, 21 → 21
+    v=$(printf '%s' "$1" | tr -cd '0-9.')
+    case "$v" in 1.*) v=${v#1.} ;; esac
+    printf '%s\n' "${v%%.*}"
+}
+
+# ----------------------------------------------------------------------------
+# Detect COMPILE-TIME Java (source compatibility)
+# ----------------------------------------------------------------------------
+detect_compile_java() {
+    raw=""
+
+    # Maven
+    if [ -f pom.xml ]; then
+        raw=$(awk -F'[<>]' '
+            /<maven.compiler.release>/ {print $3; exit}
+            /<maven.compiler.source>/  {print $3; exit}
+            /<java.version>/           {print $3; exit}
+        ' pom.xml 2>/dev/null)
+    fi
+
+    # Maven JVM flags
+    if [ -z "$raw" ] && [ -f .mvn/jvm.config ]; then
+        raw=$(grep -- '--source\|--release' .mvn/jvm.config 2>/dev/null |
+              tr -cd '0-9.' | head -1)
+    fi
+
+    # Gradle
+    if [ -z "$raw" ]; then
+        raw=$(grep 'sourceCompatibility' build.gradle* 2>/dev/null |
+              tr -cd '0-9.' | head -1)
+    fi
+
+    # Gradle toolchain
+    if [ -z "$raw" ]; then
+        raw=$(grep 'languageVersion' build.gradle* 2>/dev/null |
+              tr -cd '0-9.' | head -1)
+    fi
+
+    # Ant
+    if [ -z "$raw" ] && [ -f build.xml ]; then
+        raw=$(awk '
+            match($0,/source="[^"]+"/){
+                print substr($0,RSTART+8,RLENGTH-9); exit
+            }
+            /java.version/{
+                gsub(/[^0-9.]/,""); print; exit
+            }' build.xml 2>/dev/null)
+    fi
+
+    # Version managers
+    [ -z "$raw" ] && [ -f .java-version ] && raw=$(cat .java-version)
+    [ -z "$raw" ] && [ -f .tool-versions ] &&
+        raw=$(awk '$1=="java"{print $2; exit}' .tool-versions)
+    [ -z "$raw" ] && [ -f .sdkmanrc ] &&
+        raw=$(grep '^java=' .sdkmanrc | cut -d= -f2)
+
+    [ -z "$raw" ] && raw=17
+
+    strip_java_version "$raw"
+}
+
+# ----------------------------------------------------------------------------
+# Detect RUNTIME Java (target compatibility)
+# ----------------------------------------------------------------------------
+detect_runtime_java() {
+    raw=""
+
+    # Maven
+    if [ -f pom.xml ]; then
+        raw=$(awk -F'[<>]' '
+            /<maven.compiler.release>/ {print $3; exit}
+            /<maven.compiler.target>/  {print $3; exit}
+        ' pom.xml 2>/dev/null)
+    fi
+
+    # Gradle
+    if [ -z "$raw" ]; then
+        raw=$(grep 'targetCompatibility' build.gradle* 2>/dev/null |
+              tr -cd '0-9.' | head -1)
+    fi
+
+    # Ant
+    if [ -z "$raw" ] && [ -f build.xml ]; then
+        raw=$(awk '
+            match($0,/target="[^"]+"/){
+                print substr($0,RSTART+8,RLENGTH-9); exit
+            }' build.xml 2>/dev/null)
+    fi
+
+    # Framework-enforced minimums (only if NOTHING specified)
+    if [ -z "$raw" ]; then
+        case "${FRAMEWORK_TYPE:-}" in
+            springboot)
+                if grep '<version>3\.' pom.xml 2>/dev/null ||
+                   grep 'springBootVersion.*3\.' build.gradle* 2>/dev/null; then
+                    raw=17
+                fi
+                ;;
+            jakartaee)
+                raw=11
+                ;;
         esac
-        ;;
-    build.gradle|build.gradle.kts)
-        case "$DISTRO" in
-            alpine)   printf 'gradle:%s-jdk%s-alpine\n' "$GRADLE_VER" "$JAVA_VER" ;;
-            corretto) printf 'gradle:%s-jdk%s-amazoncorretto\n' "$GRADLE_VER" "$JAVA_VER" ;;
-            liberica) printf 'bellsoft/liberica-openjdk-alpine-gradle:%s\n' "$JAVA_VER" ;;
-            ubi)      printf 'registry.access.redhat.com/ubi9/openjdk-%s:latest\n' "$JAVA_VER" ;;
-            *)        printf 'gradle:%s-jdk%s\n' "$GRADLE_VER" "$JAVA_VER" ;;
-        esac
-        ;;
-    build.xml)
-        case "$DISTRO" in
-            alpine)   printf 'eclipse-temurin:%s-jdk-alpine\n' "$JAVA_VER" ;;
-            corretto) printf 'amazoncorretto:%s\n' "$JAVA_VER" ;;
-            liberica) printf 'bellsoft/liberica-openjdk-alpine:%s\n' "$JAVA_VER" ;;
-            ubi)      printf 'registry.access.redhat.com/ubi9/openjdk-%s:latest\n' "$JAVA_VER" ;;
-            *)        printf 'eclipse-temurin:%s-jdk\n' "$JAVA_VER" ;;
-        esac
-        ;;
-    *)
-        printf 'eclipse-temurin:%s-jdk\n' "$JAVA_VER"
-        ;;
+    fi
+
+    # Final fallback
+    [ -z "$raw" ] && raw=$(detect_compile_java)
+
+    strip_java_version "$raw"
+}
+
+# ----------------------------------------------------------------------------
+# Dispatcher
+# ----------------------------------------------------------------------------
+[ $# -eq 1 ] || posix_err "Usage: $0 detect_compile_java|detect_runtime_java"
+
+case "$1" in
+    detect_compile_java) detect_compile_java ;;
+    detect_runtime_java) detect_runtime_java ;;
+    *) posix_err "Unknown function: $1" ;;
 esac
 EOF
-    ARG BUILD_IMAGE=${STDOUT}
+
+RUN chmod +x /usr/local/bin/detect_java_version.sh
+
+COPY <<-"EOF" /usr/local/bin/detect_build_image.sh
+# ============================================================================
+# Resolve BUILD-TIME JDK image (fully user-customizable)
+#
+# ENV VARS / META ARGS:
+#   DISTRO        - temurin | alpine | corretto | liberica | ubi | graalvm
+#   JDK_VERSION  - major or full (8,11,17,21,22,23,24,...)
+#   BUILD_NATIVE  - true | false
+#   DISTRO_VARIANT- optional, e.g., al2023, ubi8, ubi9
+#
+# STDOUT: full OCI image reference
+# ============================================================================
+resolve_build_jdk_image() {
+    distro="${DISTRO:-temurin}"
+    java="${JDK_VERSION:-17}"
+    native="${BUILD_NATIVE:-false}"
+    variant="${DISTRO_VARIANT:-}"
+
+    # Native builds => GraalVM builder
+    if [ "$native" = "true" ]; then
+        printf '%s' "ghcr.io/graalvm/native-image-community:${java}${variant:+-$variant}"
+        return
+    fi
+
+    case "$distro" in
+        temurin)
+            printf '%s' "eclipse-temurin:${java}-jdk${variant:+-$variant}"
+            ;;
+
+        alpine)
+            printf '%s' "bellsoft/liberica-openjdk-alpine:${java}${variant:+-$variant}"
+            ;;
+
+        corretto)
+            # variant can be e.g., al2023, al2022, etc.
+            printf '%s' "amazoncorretto:${java}${variant:+-$variant}"
+            ;;
+
+        liberica)
+            printf '%s' "bellsoft/liberica-openjdk:${java}${variant:+-$variant}"
+            ;;
+
+        ubi)
+            # variant can be ubi8 / ubi9 / etc.
+            printf '%s' "registry.access.redhat.com/ubi${variant:-9}/openjdk-${java}-devel"
+            ;;
+
+        graalvm)
+            printf '%s' "ghcr.io/graalvm/jdk-community:${java}${variant:+-$variant}"
+            ;;
+
+        *)
+            # fallback to safe Temurin
+            printf '%s' "eclipse-temurin:${java}-jdk${variant:+-$variant}"
+            ;;
+    esac
+}
+
+resolve_build_jdk_image
+EOF
+
+RUN chmod +x /usr/local/bin/detect_build_image.sh
+
+IF RUN /usr/local/bin/detect-meta.sh detect_build_native
+    ARG BUILD_NATIVE=${STDOUT}
 ELSE
-    RUN echo "${STDERR}" >&2 && exit 1
+    RUN echo "failed to retrive BUILD_NATIVE: {$STDOUT}"
 ENDIF
 
-IF PROC --from=busybox:latest sh -eux <<EOF
+IF RUN /usr/local/bin/detect-meta.sh detect_distro
+    ARG DISTRO=${STDOUT}
+ELSE
+    RUN echo "failed to retrive DISTRO: ${STDOUT}"
+ENDIF
+
+IF RUN --mount=target=. /usr/local/bin/detect-meta.sh detect_compile_java
+    ARG JDK_VERSION=${STDOUT}
+ELSE
+    RUN echo "failed to retrive JDK_VERSION: ${STDOUT}"
+ENDIF
+
+IF RUN /usr/local/bin/detect_build_image.sh
+    ARG BUILD_IMAGE=${STDOUT}
+ELSE
+    RUN echo "failed to retrive build image: ${STDOUT}"
+ENDIF
+
+COPY <<-"EOF" /usr/local/bin/detect_run_image.sh
+#!/bin/sh
+# ============================================================================
+# Resolves minimal runtime image for Java applications (Future-proof)
+# Inputs (env):
+#   DISTRO, DISTRO_VARIANT, BUILD_NATIVE, FRAMEWORK_TYPE, JDK_VERSION / JRE_VERSION
+# Output (stdout):
+#   RUN_IMAGE
+# ============================================================================
+set -eu
+
+# -----------------------
+# Environment defaults
+# -----------------------
 DISTRO="${DISTRO:-temurin}"
-CORRETTO_BASE="${CORRETTO_BASE:-al2023}"
+DISTRO_VARIANT="${DISTRO_VARIANT:-}"
 BUILD_NATIVE="${BUILD_NATIVE:-false}"
-JRE_VERSION="${JRE_VERSION:-}"
+FRAMEWORK_TYPE="${FRAMEWORK_TYPE:-standard}"
+JAVA_VER="${JRE_VERSION:-}"
 
-# Discover build descriptor
-BT=""
-for f in pom.xml build.gradle build.gradle.kts build.xml; do
-    if [ -f "$f" ]; then
-        BT="$f"
-        break
-    fi
-done
-
-# Detect Java version (BusyBox safe)
-detect_java_version() {
-    raw="${JRE_VERSION:-}"
-
-    # Check version files
-    if [ -z "$raw" ]; then
-        for f in .java-version .tool-versions gradle.properties; do
-            [ -f "$f" ] || continue
-            
-            # BusyBox grep doesn't handle -E well, check patterns separately
-            case "$f" in
-                .tool-versions)
-                    # Check for java or temurin lines
-                    line=""
-                    if grep '^java' "$f" >/dev/null 2>&1; then
-                        line=$(grep '^java' "$f" 2>/dev/null)
-                    elif grep '^temurin' "$f" >/dev/null 2>&1; then
-                        line=$(grep '^temurin' "$f" 2>/dev/null)
-                    fi
-                    if [ -n "$line" ]; then
-                        raw=$(echo "$line" | awk '{print $2}' | tr -cd '0-9.')
-                    fi
-                    ;;
-                gradle.properties)
-                    # Check both patterns
-                    line=""
-                    if grep 'javaVersion=' "$f" >/dev/null 2>&1; then
-                        line=$(grep 'javaVersion=' "$f" 2>/dev/null)
-                    elif grep 'java\.version=' "$f" >/dev/null 2>&1; then
-                        line=$(grep 'java\.version=' "$f" 2>/dev/null)
-                    fi
-                    if [ -n "$line" ]; then
-                        raw=$(echo "$line" | cut -d= -f2 | tr -cd '0-9.')
-                    fi
-                    ;;
-                .java-version)
-                    # Simple number extraction
-                    raw=$(tr -cd '0-9.' < "$f" 2>/dev/null || true)
-                    ;;
-            esac
-            [ -n "$raw" ] && break
-        done
-    fi
-
-    # Build file fallback (simplified for BusyBox)
-    if [ -z "$raw" ] && [ -n "$BT" ]; then
-        case "$BT" in
-            pom.xml)
-                # Check patterns separately
-                line=""
-                if grep '<java\.version>' "$BT" >/dev/null 2>&1; then
-                    line=$(grep '<java\.version>' "$BT" 2>/dev/null)
-                elif grep '<maven\.compiler\.release>' "$BT" >/dev/null 2>&1; then
-                    line=$(grep '<maven\.compiler\.release>' "$BT" 2>/dev/null)
-                fi
-                if [ -n "$line" ]; then
-                    raw=$(echo "$line" | sed 's/.*>\([0-9][0-9.]*\)<.*/\1/' 2>/dev/null || true)
-                fi
-                ;;
-            build.gradle*)
-                # Check both patterns
-                line=""
-                if grep -i 'sourceCompatibility' "$BT" >/dev/null 2>&1; then
-                    line=$(grep -i 'sourceCompatibility' "$BT" 2>/dev/null)
-                elif grep -i 'targetCompatibility' "$BT" >/dev/null 2>&1; then
-                    line=$(grep -i 'targetCompatibility' "$BT" 2>/dev/null)
-                fi
-                if [ -n "$line" ]; then
-                    raw=$(echo "$line" | tr -cd '0-9.')
-                fi
-                ;;
-        esac
-    fi
-
-    # Normalize: 1.8 -> 8, keep major version
-    if [ -n "$raw" ]; then
-        # Remove leading "1." if present
-        case "$raw" in
-            1.*) raw=$(echo "$raw" | cut -c3-) ;;
-        esac
-        # Keep only major version
-        clean=$(echo "$raw" | cut -d. -f1)
-    else
-        clean=""
-    fi
-    
-    # Default to 17
-    case "$clean" in
-        ""|*[!0-9]*) clean="17" ;;
-    esac
-
-    printf '%s' "$clean"
-}
-
-JAVA_VER=$(detect_java_version)
-
-# WAR/JAR detection
+# -----------------------
+# WAR detection (generic)
+# -----------------------
 is_war() {
-    # Check Maven
-    if [ -f "pom.xml" ] && grep '<packaging>war</packaging>' pom.xml >/dev/null 2>&1; then
-        return 0
-    fi
-    
-    # Check Gradle
+    [ -f pom.xml ] && grep '<packaging>war</packaging>' pom.xml >/dev/null 2>&1 && return 0
     for f in build.gradle build.gradle.kts; do
-        if [ -f "$f" ] && grep -i 'apply.*plugin.*war\|id.*war' "$f" >/dev/null 2>&1; then
-            return 0
-        fi
+        [ -f "$f" ] && grep -i 'apply.*plugin.*war\|id.*war' "$f" >/dev/null 2>&1 && return 0
     done
-    
     return 1
 }
 
-# Framework detection helpers (BusyBox safe)
-has_dep() {
-    [ -n "$BT" ] && grep -i "$1" "$BT" >/dev/null 2>&1
-    return $?
-}
+# -----------------------
+# Runtime image resolver
+# -----------------------
+resolve_run_image() {
+    [ -n "$JAVA_VER" ] || {
+        printf '[ERROR] JRE_VERSION or detect_java_version() must be set\n' >&2
+        exit 1
+    }
 
-is_springboot() {
-    has_dep 'spring-boot-starter'
-}
-
-is_quarkus() {
-    # Check Maven or Gradle patterns separately
-    if has_dep 'quarkus-maven-plugin' || has_dep 'io.quarkus' || has_dep 'quarkus-gradle-plugin'; then
-        return 0
-    fi
-    return 1
-}
-
-is_micronaut() {
-    if has_dep 'micronaut-bom' || has_dep 'io.micronaut' || has_dep 'micronaut-gradle-plugin'; then
-        return 0
-    fi
-    return 1
-}
-
-# Check if has native build tools
-is_native_build() {
+    # -----------------------
+    # Native builds
+    # -----------------------
     if [ "$BUILD_NATIVE" = "true" ]; then
-        return 0
-    fi
-    
-    # Check for native build indicators
-    if [ -n "$BT" ]; then
-        if grep -i 'native-maven-plugin' "$BT" >/dev/null 2>&1 || \
-           grep -i 'org.graalvm.buildtools' "$BT" >/dev/null 2>&1 || \
-           grep -i 'quarkus.package.type.*native' "$BT" >/dev/null 2>&1; then
-            return 0
-        fi
-    fi
-    return 1
-}
-
-# Resolve specialized minimal runtime image
-resolve_image() {
-    # GraalVM native image - absolute minimal
-    if is_native_build; then
         case "$DISTRO" in
-            scratch)    echo "scratch" ;;
-            distroless) echo "gcr.io/distroless/static-debian12:latest" ;;
-            alpine)     echo "alpine:3.20" ;;
-            *)          echo "gcr.io/distroless/cc-debian12:latest" ;;
+            scratch)    printf 'scratch' ;;
+            alpine)     printf 'alpine:3.20' ;;
+            distroless) printf 'gcr.io/distroless/static-debian12:latest' ;;
+            *)          printf 'gcr.io/distroless/cc-debian12:latest' ;;
         esac
         return
     fi
 
-    # WAR apps - minimal server images
+    # -----------------------
+    # WAR deployments → servlet containers
+    # -----------------------
     if is_war; then
-        # Spring Boot WAR - use JRE (Undertow/Tomcat embedded)
-        if is_springboot; then
-            case "$DISTRO" in
-                alpine)     printf 'eclipse-temurin:%s-jre-alpine\n' "$JAVA_VER" ;;
-                distroless)
-                    if [ "$JAVA_VER" -ge 11 ] 2>/dev/null; then
-                        printf 'gcr.io/distroless/java%s-debian12:nonroot\n' "$JAVA_VER"
-                    else
-                        printf 'eclipse-temurin:%s-jre\n' "$JAVA_VER"
-                    fi
-                    ;;
-                *)          printf 'eclipse-temurin:%s-jre\n' "$JAVA_VER" ;;
-            esac
-        # Jetty WAR
-        elif has_dep 'jetty'; then
-            case "$DISTRO" in
-                alpine) printf 'jetty:12-jre%s-alpine\n' "$JAVA_VER" ;;
-                *)      printf 'jetty:12-jre%s\n' "$JAVA_VER" ;;
-            esac
-        # Tomcat WAR
-        elif has_dep 'tomcat'; then
-            case "$DISTRO" in
-                alpine) printf 'tomcat:10-jre%s-temurin-alpine\n' "$JAVA_VER" ;;
-                *)      printf 'tomcat:10-jre%s-temurin\n' "$JAVA_VER" ;;
-            esac
-        # Default WAR - minimal JRE
-        else
-            case "$DISTRO" in
-                alpine)     printf 'eclipse-temurin:%s-jre-alpine\n' "$JAVA_VER" ;;
-                distroless)
-                    if [ "$JAVA_VER" -ge 11 ] 2>/dev/null; then
-                        printf 'gcr.io/distroless/java%s-debian12:nonroot\n' "$JAVA_VER"
-                    else
-                        printf 'eclipse-temurin:%s-jre\n' "$JAVA_VER"
-                    fi
-                    ;;
-                *)          printf 'eclipse-temurin:%s-jre\n' "$JAVA_VER" ;;
-            esac
-        fi
-        return
-    fi
-
-    # Framework-specific JAR images
-    if is_springboot; then
-        # Spring Boot - JRE only (embedded server)
-        case "$DISTRO" in
-            alpine)     printf 'eclipse-temurin:%s-jre-alpine\n' "$JAVA_VER" ;;
-            distroless)
-                if [ "$JAVA_VER" -ge 11 ] 2>/dev/null; then
-                    printf 'gcr.io/distroless/java%s-debian12:nonroot\n' "$JAVA_VER"
-                else
-                    printf 'eclipse-temurin:%s-jre\n' "$JAVA_VER"
-                fi
-                ;;
-            *)          printf 'eclipse-temurin:%s-jre\n' "$JAVA_VER" ;;
+        case "$FRAMEWORK_TYPE" in
+            jetty)
+                printf 'jetty:12-jre%s%s' "$JAVA_VER" "${DISTRO_VARIANT:+-$DISTRO_VARIANT}"
+                return ;;
+            tomcat|*)
+                printf 'tomcat:10-jre%s-temurin%s' "$JAVA_VER" "${DISTRO_VARIANT:+-$DISTRO_VARIANT}"
+                return ;;
         esac
-        return
     fi
 
-    if is_quarkus; then
-        # Quarkus - optimized for Red Hat images if available
-        case "$DISTRO" in
-            alpine)     printf 'eclipse-temurin:%s-jre-alpine\n' "$JAVA_VER" ;;
-            ubi*)       printf 'registry.access.redhat.com/ubi9/openjdk-%s-runtime:latest\n' "$JAVA_VER" ;;
-            distroless)
-                if [ "$JAVA_VER" -ge 11 ] 2>/dev/null; then
-                    printf 'gcr.io/distroless/java%s-debian12:nonroot\n' "$JAVA_VER"
-                else
-                    printf 'eclipse-temurin:%s-jre\n' "$JAVA_VER"
-                fi
-                ;;
-            *)          printf 'eclipse-temurin:%s-jre\n' "$JAVA_VER" ;;
-        esac
-        return
-    fi
-
-    if is_micronaut; then
-        # Micronaut - standard JRE
-        case "$DISTRO" in
-            alpine)     printf 'eclipse-temurin:%s-jre-alpine\n' "$JAVA_VER" ;;
-            distroless)
-                if [ "$JAVA_VER" -ge 11 ] 2>/dev/null; then
-                    printf 'gcr.io/distroless/java%s-debian12:nonroot\n' "$JAVA_VER"
-                else
-                    printf 'eclipse-temurin:%s-jre\n' "$JAVA_VER"
-                fi
-                ;;
-            *)          printf 'eclipse-temurin:%s-jre\n' "$JAVA_VER" ;;
-        esac
-        return
-    fi
-
-    # Default JARs - smallest possible runtime
+    # -----------------------
+    # JAR deployments → minimal JVM runtimes
+    # -----------------------
     case "$DISTRO" in
-        scratch)
-            # Only for native binaries
-            echo "scratch"
-            ;;
         distroless)
-            # Minimal secure runtime
             if [ "$JAVA_VER" -ge 11 ] 2>/dev/null; then
-                printf 'gcr.io/distroless/java%s-debian12:nonroot\n' "$JAVA_VER"
+                printf 'gcr.io/distroless/java%s-debian12:nonroot' "$JAVA_VER"
             else
-                printf 'eclipse-temurin:%s-jre\n' "$JAVA_VER"
+                printf 'eclipse-temurin:%s-jre%s' "$JAVA_VER" "${DISTRO_VARIANT:+-$DISTRO_VARIANT}"
             fi
             ;;
         alpine)
-            # Small Alpine-based JRE
-            printf 'eclipse-temurin:%s-jre-alpine\n' "$JAVA_VER"
+            printf 'eclipse-temurin:%s-jre-alpine%s' "$JAVA_VER" "${DISTRO_VARIANT:+-$DISTRO_VARIANT}"
             ;;
-        ubi-micro)
-            # Red Hat absolute minimal (~30MB)
-            echo 'registry.access.redhat.com/ubi9/ubi-micro:latest'
-            ;;
-        ubi-minimal|ubi)
-            # Red Hat minimal with Java
-            printf 'registry.access.redhat.com/ubi9/openjdk-%s-runtime:latest\n' "$JAVA_VER"
+        ubi|ubi-minimal)
+            printf 'registry.access.redhat.com/ubi%s/openjdk-%s-runtime:latest' "${DISTRO_VARIANT:-9}" "$JAVA_VER"
             ;;
         corretto)
-            # Amazon Corretto JRE
-            printf 'amazoncorretto:%s-jre\n' "$JAVA_VER"
+            printf 'amazoncorretto:%s-jre%s' "$JAVA_VER" "${DISTRO_VARIANT:+-$DISTRO_VARIANT}"
             ;;
         liberica)
-            # BellSoft Liberica Alpine JRE
-            printf 'bellsoft/liberica-openjre-alpine:%s\n' "$JAVA_VER"
+            printf 'bellsoft/liberica-openjre-alpine:%s%s' "$JAVA_VER" "${DISTRO_VARIANT:+-$DISTRO_VARIANT}"
             ;;
-        temurin)
-            # Standard Eclipse Temurin JRE
-            printf 'eclipse-temurin:%s-jre\n' "$JAVA_VER"
-            ;;
-        *)
-            # Default to smallest available
-            printf 'eclipse-temurin:%s-jre-alpine\n' "$JAVA_VER"
+        temurin|*)
+            printf 'eclipse-temurin:%s-jre%s' "$JAVA_VER" "${DISTRO_VARIANT:+-$DISTRO_VARIANT}"
             ;;
     esac
 }
 
-# Output recommended RUN_IMAGE
-resolve_image
+# -----------------------
+# Execute
+# -----------------------
+resolve_run_image
 EOF
+
+RUN chmod +x /usr/local/bin/detect_run_image.sh
+
+IF RUN --mount=target=. /usr/local/bin/detect-meta.sh detect_framework
+    ARG FRAMEWORK_TYPE=${STDOUT}
+ELSE
+    RUN echo "failed to retrive FRAMEWORK_TYPE: ${STDOUT}"
+ENDIF
+
+IF RUN --mount=target=. /usr/local/bin/detect_java_version.sh detect_runtime_java
+    ARG JRE_VERSION=${STDOUT}
+ELSE
+    RUN echo "failed to retrive JRE_VERSION: ${STDOUT}"
+ENDIF
+
+IF RUN --mount=target=. /usr/local/bin/detect_run_image.sh
     ARG RUN_IMAGE=${STDOUT}
 ELSE
-    RUN echo "${STDERR}" >&2 && exit 1
+    RUN echo "failed to retrive RUN_IMAGE: ${STDOUT}"
 ENDIF
+
+COPY <<-"EOF" /usr/local/bin/download_deps.sh
+#!/bin/sh
+# ============================================================================
+# Production-Grade Dependency Resolver
+# Optimized for Docker caching, CI stability, and zero false positives
+# Supports: Maven, Gradle, Ant (+ Ivy)
+# ============================================================================
+set -eu
+
+###############################################################################
+# Logging (auto-disable ANSI if not TTY)
+###############################################################################
+if [ -t 1 ]; then
+    BLUE='\033[0;34m'; YELLOW='\033[0;33m'; RED='\033[0;31m'; NC='\033[0m'
+else
+    BLUE=''; YELLOW=''; RED=''; NC=''
+fi
+
+log()  { printf '%s[INFO]%s %s\n'  "$BLUE" "$NC" "$*"; }
+warn() { printf '%s[WARN]%s %s\n'  "$YELLOW" "$NC" "$*" >&2; }
+err()  { printf '%s[ERROR]%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
+
+###############################################################################
+# Build tool detection (strict, wrapper-first)
+###############################################################################
+detect_build_tool() {
+    if [ -x "./mvnw" ]; then
+        printf 'maven-w'
+    elif [ -f "pom.xml" ]; then
+        printf 'maven'
+    elif [ -x "./gradlew" ]; then
+        printf 'gradle-w'
+    elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+        printf 'gradle'
+    elif [ -f "build.xml" ]; then
+        printf 'ant'
+    else
+        printf 'none'
+    fi
+}
+
+###############################################################################
+# Dependency resolution
+###############################################################################
+download_dependencies() {
+    tool=$(detect_build_tool)
+
+    # User controls
+    MVN_SETTINGS="${MAVEN_SETTINGS_PATH:-}"
+    GRADLE_INIT="${GRADLE_INIT_PATH:-}"
+    REFRESH="${REFRESH_DEPENDENCIES:-false}"
+    NET_RETRIES="${NET_RETRIES:-3}"
+    NET_TIMEOUT="${NET_TIMEOUT:-30}"
+
+    case "$tool" in
+        maven|maven-w)
+            exe="mvn"; [ "$tool" = "maven-w" ] && exe="./mvnw"
+            log "Resolving Maven dependencies (parallel, offline-ready)"
+
+            # Auto-detect settings.xml if not explicitly provided
+            if [ -z "$MVN_SETTINGS" ] && [ -f "$HOME/.m2/settings.xml" ]; then
+                MVN_SETTINGS="$HOME/.m2/settings.xml"
+            fi
+
+            MAVEN_OPTS="
+                -Dmaven.repo.local=${MAVEN_REPO_LOCAL:-$HOME/.m2/repository}
+                -Dmaven.wagon.http.retryHandler.count=$NET_RETRIES
+                -Dmaven.wagon.httpconnectionManager.ttlSeconds=$NET_TIMEOUT
+            "
+
+            MAVEN_OPTS="$MAVEN_OPTS" \
+            $exe dependency:go-offline \
+                ${MVN_SETTINGS:+-s "$MVN_SETTINGS"} \
+                -B -T 1C \
+                -Dmdep.analyze.skip=true \
+                --fail-never
+            ;;
+
+        gradle|gradle-w)
+            exe="gradle"; [ "$tool" = "gradle-w" ] && exe="./gradlew"
+            log "Resolving Gradle dependencies (cache-warming)"
+
+            args="--no-daemon --console=plain --stacktrace"
+            [ "$REFRESH" = "true" ] && args="$args --refresh-dependencies"
+
+            # Gradle 8+ safe, config-cache compatible
+            GRADLE_OPTS="-Dorg.gradle.internal.http.connectionTimeout=$((NET_TIMEOUT*1000)) \
+                          -Dorg.gradle.internal.http.socketTimeout=$((NET_TIMEOUT*1000))"
+
+            GRADLE_OPTS="$GRADLE_OPTS" \
+            $exe dependencies $args \
+                ${GRADLE_INIT:+-I "$GRADLE_INIT"} \
+                || warn "Some Gradle configurations failed to resolve"
+            ;;
+
+        ant)
+            log "Resolving Ant dependencies (Ivy-aware)"
+
+            if [ -f "ivy.xml" ] || grep -qi 'ivy' build.xml; then
+                ant -f build.xml resolve -Divy.offline=false
+            else
+                warn "Ant detected but Ivy not configured; skipping"
+            fi
+            ;;
+
+        none)
+            err "No supported build system detected"
+            ;;
+    esac
+}
+
+###############################################################################
+# Cleanup (Docker layer minimization)
+###############################################################################
+cleanup_metadata() {
+    tool=$(detect_build_tool)
+    log "Cleaning transient metadata"
+
+    case "$tool" in
+        maven*)
+            rm -rf target/maven-archiver 2>/dev/null || true
+            ;;
+        gradle*)
+            rm -rf .gradle/caches/journal-* \
+                   .gradle/daemon \
+                   .gradle/native \
+                   .gradle/workers 2>/dev/null || true
+            ;;
+    esac
+}
+
+###############################################################################
+# Dispatcher (explicit execution only)
+###############################################################################
+[ $# -gt 0 ] || err "Usage: $0 download_dependencies | cleanup_metadata"
+
+case "$1" in
+    download_dependencies) download_dependencies ;;
+    cleanup_metadata)      cleanup_metadata ;;
+    *)                     err "Unknown function: $1" ;;
+esac
+EOF
+
+RUN chmod +x /usr/local/bin/download_deps.sh
+
+COPY <<-"EOF" /usr/local/bin/copy_artifacts.sh
+#!/bin/sh
+# =============================================================================
+# ULTIMATE JAVA ARTIFACT RESOLVER — FINAL ENTERPRISE EDITION
+# Output: Dockerfile COPY instructions + ENTRYPOINT_ARTIFACT
+# =============================================================================
+set -eu
+
+###############################################################################
+# CONFIG
+###############################################################################
+OUT_ROOT="${JAVA_LAYOUT_ROOT:-/opt/app}"
+APP_DIR="$OUT_ROOT/app"
+LIB_DIR="$APP_DIR/lib"
+ROOTS=". target build dist out"
+
+ARTIFACT_PATH="${ARTIFACT_PATH:-}"
+LIBS_PATH="${LIBS_PATH:-}"
+
+###############################################################################
+# LOGGING
+###############################################################################
+if [ -t 2 ]; then
+  I="\033[1;34m[INFO]\033[0m"
+  E="\033[1;31m[ERROR]\033[0m"
+else
+  I="[INFO]"
+  E="[ERROR]"
+fi
+
+log(){ printf "%s %s\n" "$I" "$*" >&2; }
+die(){ printf "%s %s\n" "$E" "$*" >&2; exit 1; }
+
+###############################################################################
+# SAFE HELPERS (NO FALSE POSITIVES)
+###############################################################################
+is_elf()        { file "$1" 2>/dev/null | grep -qi '^ELF .* executable'; }
+is_zip_ok()     { unzip -t "$1" >/dev/null 2>&1; }
+
+has_main() {
+  unzip -p "$1" META-INF/MANIFEST.MF 2>/dev/null |
+    grep -qi '^Main-Class:'
+}
+
+is_boot() {
+  unzip -l "$1" 2>/dev/null |
+    grep -qE 'BOOT-INF/|org/springframework/boot/loader'
+}
+
+is_quarkus_runner() {
+  unzip -l "$1" 2>/dev/null | grep -q 'io/quarkus/runtime'
+}
+
+is_tooling() {
+  echo "$1" | grep -qiE '(maven-|gradle-|plugin-|annotation-|processor)'
+}
+
+is_test_artifact() {
+  echo "$1" | grep -qiE '(test|junit|mockito)'
+}
+
+size() {
+  stat -c %s "$1" 2>/dev/null || ls -ln "$1" | awk '{print $5}'
+}
+
+###############################################################################
+# OUTPUT EMITTERS (STRICT)
+###############################################################################
+emit_file() {
+  printf 'COPY --from=builder %s %s/%s\n' "$1" "$APP_DIR" "$2"
+}
+
+emit_dir() {
+  printf 'COPY --from=builder %s/ %s/\n' "$1" "$2"
+}
+
+emit_entry() {
+  printf 'ENTRYPOINT_ARTIFACT=%s\n' "$1"
+}
+
+###############################################################################
+# 1. USER OVERRIDE (ABSOLUTE AUTHORITY)
+###############################################################################
+if [ -n "$ARTIFACT_PATH" ]; then
+  [ -e "$ARTIFACT_PATH" ] || die "ARTIFACT_PATH does not exist"
+
+  log "User override: $ARTIFACT_PATH"
+
+  if [ -d "$ARTIFACT_PATH" ]; then
+    emit_dir "$ARTIFACT_PATH" "$APP_DIR"
+    emit_entry "$APP_DIR"
+  else
+    name="$(basename "$ARTIFACT_PATH")"
+    emit_file "$ARTIFACT_PATH" "$name"
+    emit_entry "$APP_DIR/$name"
+  fi
+
+  [ -n "$LIBS_PATH" ] && [ -d "$LIBS_PATH" ] && emit_dir "$LIBS_PATH" "$LIB_DIR"
+  exit 0
+fi
+
+###############################################################################
+# 2. NATIVE IMAGE (STRICT ELF)
+###############################################################################
+for r in $ROOTS; do
+  [ -d "$r" ] || continue
+  find "$r" -type f -perm -111 2>/dev/null |
+  while read -r f; do
+    is_elf "$f" || continue
+    echo "$f"
+    break
+  done
+done | head -n1 | while read -r bin; do
+  log "Native executable detected: $bin"
+  emit_file "$bin" run.bin
+  emit_entry "$APP_DIR/run.bin"
+  exit 0
+done
+
+###############################################################################
+# 3. QUARKUS FAST-JAR (IMMUTABLE)
+###############################################################################
+for r in $ROOTS; do
+  if [ -f "$r/quarkus-app/quarkus-run.jar" ]; then
+    log "Quarkus fast-jar detected"
+    emit_dir "$r/quarkus-app" "$APP_DIR"
+    emit_entry "$APP_DIR/quarkus-run.jar"
+    exit 0
+  fi
+done
+
+###############################################################################
+# 4. ARTIFACT SCORING ENGINE
+###############################################################################
+log "Scanning JVM artifacts..."
+
+BEST="$(
+for r in $ROOTS; do
+  [ -d "$r" ] || continue
+  find "$r" -type f \( -name '*.jar' -o -name '*.war' \) 2>/dev/null |
+  while read -r a; do
+    is_tooling "$a" && continue
+    is_test_artifact "$a" && continue
+    is_zip_ok "$a" || continue
+
+    tier=1
+    is_boot "$a" && tier=6
+    is_quarkus_runner "$a" && tier=5
+    has_main "$a" && tier=4
+    [ "${a##*.}" = war ] && tier=3
+
+    sz=$(printf "%012d" "$(size "$a")")
+    printf "%02d-%s %s\n" "$tier" "$sz" "$a"
+  done
+done | sort -r | head -n1 | awk '{print $2}'
+)"
+
+###############################################################################
+# 5. FALLBACK: EXPLODED APP
+###############################################################################
+if [ -z "$BEST" ]; then
+  for r in $ROOTS; do
+    for d in "$r/classes" "$r/app" "$r/exploded"; do
+      [ -d "$d" ] || continue
+      log "Exploded JVM app detected: $d"
+      emit_dir "$d" "$APP_DIR"
+      emit_entry "$APP_DIR"
+      exit 0
+    done
+  done
+  die "No runnable Java artifact found"
+fi
+
+###############################################################################
+# 6. LIBRARY DISCOVERY (THIN JARS)
+###############################################################################
+for d in $(
+  find . -type d \( -name lib -o -name libs -o -name dependency \) 2>/dev/null |
+  while read -r l; do
+    ls "$l"/*.jar >/dev/null 2>&1 && echo "$l"
+  done | sort -u
+); do
+  log "Including libs: $d"
+  emit_dir "$d" "$LIB_DIR"
+done
+
+###############################################################################
+# 7. FINAL EMISSION
+###############################################################################
+name="$(basename "$BEST")"
+log "Selected artifact: $BEST"
+
+emit_file "$BEST" "$name"
+emit_entry "$APP_DIR/$name"
+EOF
+
+RUN chmod +x /usr/local/bin/copy_artifacts.sh
 
 # ============================================================================
 # BASE BUILD STAGE
@@ -562,7 +815,7 @@ FROM ${BUILD_IMAGE} AS base
 WORKDIR /home/dexfile/app
 
 # Install required build tools for native builds
-IF PROC [ "${BUILD_NATIVE}" = "true" ]
+IF PROC --from=busybox:latest [ "${BUILD_NATIVE}" = "true" ]
     RUN if command -v microdnf >/dev/null 2>&1; then \
             microdnf install -y gcc glibc-devel zlib-devel libstdc++-static; \
         elif command -v apk >/dev/null 2>&1; then \
@@ -602,25 +855,15 @@ COPY pom.xml* settings.xml* build.gradle* build.gradle.kts* \
 RUN if [ -f "gradlew" ]; then chmod +x gradlew; fi && \
     if [ -f "mvnw" ]; then chmod +x mvnw; fi
 
+COPY --from=meta-stage /usr/local/bin/download_deps.sh /usr/local/bin/download_deps.sh
+RUN chmod +x /usr/local/bin/download_deps.sh
+
 # Download dependencies with aggressive caching
 RUN --mount=type=secret,id=m2settings,target=/home/dexfile/app/settings.xml \
     --mount=type=cache,id=m2-cache,target=/root/.m2/repository,sharing=locked \
     --mount=type=cache,id=gradle-cache,target=/root/.gradle,sharing=locked \
     --mount=type=cache,id=ivy-cache,target=/root/.ivy2,sharing=locked \
-    set -e; \
-    if [ -f "mvnw" ]; then \
-        ./mvnw ${MAVEN_CLI_OPTS} dependency:resolve dependency:resolve-plugins; \
-    elif [ -f "gradlew" ]; then \
-        ./gradlew ${GRADLE_OPTS} --no-daemon dependencies; \
-    elif [ -f "pom.xml" ]; then \
-        mvn ${MAVEN_CLI_OPTS} dependency:resolve dependency:resolve-plugins; \
-    elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then \
-        gradle ${GRADLE_OPTS} --no-daemon dependencies; \
-    elif [ -f "build.xml" ]; then \
-        if [ -f "ivy.xml" ]; then \
-            ant -lib /usr/share/ant/lib resolve 2>/dev/null || echo "Ivy dependencies resolution skipped"; \
-        fi; \
-    fi
+    /usr/local/bin/download_deps.sh download_dependencies 
 
 # ============================================================================
 # BUILD STAGE
@@ -631,201 +874,258 @@ FROM base AS builder
 COPY --from=deps /home/dexfile/app /home/dexfile/app
 COPY . .
 
+COPY <<-"EOF" /usr/local/bin/build-deps.sh
+#!/bin/sh
+# ============================================================================
+# Dexfile Ultimate Artifact Builder - Enterprise-Grade
+# Builds Maven, Gradle, Ant (+ Ivy) projects to a single predictable artifact
+# Supports native-image builds (GraalVM), multi-module projects, and reproducible CI
+# Output: /home/dexfile/app.{jar|war|exe}, optional /home/dexfile/lib/, /home/dexfile/app.meta
+# ============================================================================
+set -eu
+
+OUT_DIR="/home/dexfile"
+OUT_BASE="$OUT_DIR/app"
+META_FILE="$OUT_DIR/app.meta"
+LIB_DIR="$OUT_DIR/lib"
+
+mkdir -p "$OUT_DIR" "$LIB_DIR"
+
+log()  { printf '[DEXFILE] %s\n' "$*" >&2; }
+warn() { printf '[DEXFILE][WARN] %s\n' "$*" >&2; }
+fail() { printf '[DEXFILE][ERROR] %s\n' "$*" >&2; exit 1; }
+
+###############################################################################
+# User Config
+###############################################################################
+BUILD_NATIVE="${BUILD_NATIVE:-false}"
+SKIP_TESTS="${SKIP_TESTS:-true}"
+BUILD_PROFILE="${BUILD_PROFILE:-}"
+BUILD_GOAL="${BUILD_GOAL:-}"
+PARALLELISM="${BUILD_PARALLELISM:-1C}"
+OFFLINE="${OFFLINE_BUILD:-true}"
+
+###############################################################################
+# Build System Detection
+###############################################################################
+detect_build_tool() {
+    if [ -x "./mvnw" ]; then echo "maven|./mvnw"; return; fi
+    if [ -f "pom.xml" ]; then echo "maven|mvn"; return; fi
+    if [ -x "./gradlew" ]; then echo "gradle|./gradlew"; return; fi
+    if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then echo "gradle|gradle"; return; fi
+    if [ -f "build.xml" ]; then echo "ant|ant"; return; fi
+    if [ -f "ivy.xml" ]; then echo "ivy|ant"; return; fi
+    echo "none|"
+}
+
+###############################################################################
+# Multi-module awareness
+###############################################################################
+find_executable_module_maven() {
+    # find module containing spring-boot, quarkus, or micronaut plugin
+    find . -name "pom.xml" | while read -r pom; do
+        if grep -qiE 'spring-boot|quarkus|micronaut' "$pom"; then
+            dirname "$pom"
+            return
+        fi
+    done
+}
+
+find_executable_module_gradle() {
+    # find subproject with main class or application plugin
+    find . -name "build.gradle*" | while read -r build; do
+        if grep -qiE 'mainClass|quarkus|micronaut' "$build"; then
+            dirname "$build"
+            return
+        fi
+    done
+}
+
+###############################################################################
+# GraalVM Native Check
+###############################################################################
+require_graalvm() {
+    command -v native-image >/dev/null 2>&1 || fail "BUILD_NATIVE=true but native-image not found"
+}
+
+###############################################################################
+# Artifact Finalization
+###############################################################################
+finalize_artifact() {
+    src_path="$1"
+    [ -f "$src_path" ] || fail "Artifact $src_path not found"
+    ext="${src_path##*.}"
+    target_path="$OUT_BASE.$ext"
+
+    log "Copying artifact $src_path -> $target_path"
+    cp "$src_path" "$target_path"
+
+    # Copy runtime dependencies if they exist
+    runtime_lib_dir="$(dirname "$src_path")/lib"
+    if [ -d "$runtime_lib_dir" ]; then
+        log "Copying runtime libs from $runtime_lib_dir -> $LIB_DIR"
+        cp -r "$runtime_lib_dir"/* "$LIB_DIR"/
+    fi
+
+    # Metadata for entrypoint
+    if [ "$ext" = "jar" ] || [ "$ext" = "war" ]; then
+        echo "java -jar $target_path" > "$META_FILE"
+    else
+        chmod +x "$target_path"
+        echo "$target_path" > "$META_FILE"
+    fi
+}
+
+###############################################################################
+# Maven Build
+###############################################################################
+build_maven() {
+    MVN="./mvnw"; [ -x "$MVN" ] || MVN="mvn"
+    log "Building Maven project"
+
+    # Identify module to build
+    MOD_DIR=$(find_executable_module_maven || echo ".")
+    cd "$MOD_DIR"
+
+    # Use lockfiles for reproducibility
+    [ -f pom.xml ] && log "Using pom.xml for deterministic dependencies"
+
+    FLAGS="-B -T $PARALLELISM"
+    [ "$SKIP_TESTS" = "true" ] && FLAGS="$FLAGS -DskipTests"
+    [ "$OFFLINE" = "true" ] && FLAGS="$FLAGS -o"
+    [ -n "$BUILD_PROFILE" ] && FLAGS="$FLAGS -P$BUILD_PROFILE"
+
+    if [ "$BUILD_NATIVE" = "true" ]; then
+        require_graalvm
+        log "Building native image with GraalVM"
+        # Spring Boot
+        if grep -qi 'spring-boot' pom.xml; then
+            $MVN clean package -Pnative $FLAGS
+        # Quarkus
+        elif grep -qi 'quarkus' pom.xml; then
+            $MVN clean package -Dnative $FLAGS
+        # Micronaut
+        elif grep -qi 'micronaut' pom.xml; then
+            $MVN clean package -Dpackaging=native-image $FLAGS
+        else
+            fail "Unsupported native Maven configuration"
+        fi
+        ARTIFACT=$(find target -type f -executable ! -name "*.jar" ! -name "*.war" | head -n1)
+    else
+        log "Building JVM artifact"
+        $MVN clean package $FLAGS
+
+        # Pick largest runnable artifact in module
+        ARTIFACT=$(find target -type f \( -name "*.jar" -o -name "*.war" \) \
+            ! -name "*-sources*" ! -name "*-javadoc*" ! -name "*-plain*" ! -name "original-*" \
+            | xargs ls -S | head -n1)
+    fi
+
+    [ -n "$ARTIFACT" ] || fail "Maven build produced no artifact"
+    finalize_artifact "$ARTIFACT"
+    cd - >/dev/null
+}
+
+###############################################################################
+# Gradle Build
+###############################################################################
+build_gradle() {
+    GRADLE="./gradlew"; [ -x "$GRADLE" ] || GRADLE="gradle"
+    log "Building Gradle project"
+
+    MOD_DIR=$(find_executable_module_gradle || echo ".")
+    cd "$MOD_DIR"
+
+    # Use lockfile if present
+    [ -f gradle.lockfile ] && log "Using gradle.lockfile for reproducible dependencies"
+
+    FLAGS="--no-daemon --console=plain --stacktrace"
+    [ "$SKIP_TESTS" = "true" ] && FLAGS="$FLAGS -x test"
+    [ "$OFFLINE" = "true" ] && FLAGS="$FLAGS --offline"
+
+    if [ "$BUILD_NATIVE" = "true" ]; then
+        require_graalvm
+        log "Gradle native build"
+        if $GRADLE tasks --all | grep -q nativeCompile; then
+            $GRADLE nativeCompile $FLAGS
+            ARTIFACT=$(find build/native -type f -executable | head -n1)
+        elif $GRADLE tasks --all | grep -q quarkusBuild; then
+            $GRADLE quarkusBuild -Dnative $FLAGS
+            ARTIFACT=$(find build/*/native/* -type f -executable | head -n1)
+        else
+            fail "No native Gradle tasks available"
+        fi
+    else
+        log "Gradle JVM build"
+        $GRADLE build $FLAGS
+
+        ARTIFACT=$(find build/libs -type f \( -name "*.jar" -o -name "*.war" \) \
+            ! -name "*-sources*" ! -name "*-javadoc*" ! -name "*-plain*" \
+            | xargs ls -S | head -n1)
+    fi
+
+    [ -n "$ARTIFACT" ] || fail "Gradle build produced no artifact"
+    finalize_artifact "$ARTIFACT"
+    cd - >/dev/null
+}
+
+###############################################################################
+# Ant Build (+ Ivy)
+###############################################################################
+build_ant() {
+    ANT="ant"
+    log "Building Ant/Ivy project"
+
+    # Detect WAR vs JAR
+    TARGET="jar"
+    grep -qi '<war\s' build.xml 2>/dev/null && TARGET="war"
+
+    [ "$SKIP_TESTS" = "true" ] && ANT_FLAGS="-Dskip.tests=true" || ANT_FLAGS=""
+    [ "$OFFLINE" = "true" ] && ANT_FLAGS="$ANT_FLAGS -Divy.offline=true"
+
+    $ANT clean $TARGET $ANT_FLAGS
+
+    ARTIFACT=$(find dist build -type f -name "*.$TARGET" | head -n1)
+    [ -n "$ARTIFACT" ] || fail "Ant build produced no artifact"
+    finalize_artifact "$ARTIFACT"
+}
+
+###############################################################################
+# Dispatcher
+###############################################################################
+main() {
+    BUILD_INFO=$(detect_build_tool)
+    IFS='|' read -r TOOL EXE <<EOF
+$BUILD_INFO
+EOF
+
+    [ "$TOOL" != "none" ] || fail "No supported Java build system detected"
+
+    log "Detected build tool: $TOOL"
+
+    case "$TOOL" in
+        maven)   build_maven ;;
+        gradle)  build_gradle ;;
+        ant|ivy) build_ant ;;
+        *)       fail "Unsupported build tool: $TOOL" ;;
+    esac
+
+    log "Artifact build completed successfully."
+    log "Single artifact available at: $OUT_BASE.*"
+    log "Metadata file: $META_FILE"
+}
+
+main
+EOF
+
+RUN chmod +x /usr/local/bin/build-deps.sh
+
 # Build the application with framework-specific optimizations
 RUN --mount=type=secret,id=m2settings,target=/home/dexfile/app/settings.xml \
     --mount=type=cache,id=m2-cache,target=/root/.m2/repository,sharing=locked \
     --mount=type=cache,id=gradle-cache,target=/root/.gradle,sharing=locked \
     --mount=type=cache,id=ivy-cache,target=/root/.ivy2,sharing=locked \
-    <<EOF
-set -eu
-
-###############################################################################
-# Paths & Layout
-###############################################################################
-
-OUT="${JAVA_ENTRYPOINT:-./dexfile-artifact}"
-APP_DIR="$OUT/app"
-LIB_DIR="$APP_DIR/lib"
-META_DIR="$OUT/meta"
-
-mkdir -p "$APP_DIR" "$LIB_DIR" "$META_DIR"
-
-log()  { printf '[INFO] %s\n' "$*" >&2; }
-warn() { printf '[WARN] %s\n' "$*" >&2; }
-err()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
-
-###############################################################################
-# Java helpers
-###############################################################################
-
-get_main_class() {
-    unzip -p "$1" META-INF/MANIFEST.MF 2>/dev/null \
-        | sed -n 's/^Main-Class:[[:space:]]*//p' \
-        | tr -d '\r' | sed 's/[[:space:]]*$//'
-}
-
-has_spring_boot_loader() {
-    unzip -l "$1" 2>/dev/null | grep -q 'org/springframework/boot/loader'
-}
-
-is_executable() {
-    [ -x "$1" ] || return 1
-    file "$1" 2>/dev/null | grep -qE '(ELF|Mach-O|executable)'
-}
-
-###############################################################################
-# Safe artifact selector (BusyBox-safe)
-###############################################################################
-
-pick_largest() {
-    _dir="$1"
-    _ext="${2:-}"
-
-    set -f
-    set -- $(find "$_dir" -type f \
-        ${_ext:+-name "*.$_ext"} \
-        ! -name "*-sources*.jar" \
-        ! -name "*-javadoc*.jar" \
-        ! -name "*-plain*.jar" \
-        ! -name "*-original*.jar" \
-        ! -name "*-thin*.jar" \
-        ! -name "*test*.jar" \
-        ! -name "*.xml" ! -name "*.pom" ! -name "*.sh" 2>/dev/null)
-    set +f
-
-    [ "$#" -gt 0 ] || return 1
-
-    ls -l "$@" 2>/dev/null \
-        | awk '{print $5 "\t" $NF}' \
-        | sort -nr \
-        | head -1 \
-        | cut -f2
-}
-
-###############################################################################
-# Build tool detection
-###############################################################################
-
-BT=""
-if   [ -f "./mvnw" ]; then BT="./mvnw"
-elif [ -f "pom.xml" ]; then BT="mvn"
-elif [ -f "./gradlew" ]; then BT="./gradlew"
-elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then BT="gradle"
-elif [ -f "build.xml" ]; then BT="ant"
-else
-    err "No supported Java build system detected"
-fi
-
-log "Build tool: $BT"
-case "$BT" in ./*) chmod +x "$BT" ;; esac
-
-###############################################################################
-# Build execution
-###############################################################################
-
-case "${BT##*/}" in
-    mvnw|mvn)
-        CMD="$BT"
-        if [ "${BUILD_NATIVE:-false}" = "true" ]; then
-            $CMD clean package -Pnative -DskipTests -B
-            BIN="$(pick_largest target "")" || err "Native build produced nothing"
-            is_executable "$BIN" || err "Native artifact is not executable"
-            cp "$BIN" "$APP_DIR/app"
-            echo "native" > "$META_DIR/type"
-            exit 0
-        fi
-        $CMD clean package -DskipTests -B
-        ;;
-    gradlew|gradle)
-        CMD="$BT"
-        if [ "${BUILD_NATIVE:-false}" = "true" ]; then
-            $CMD --no-daemon nativeCompile
-            BIN="$(pick_largest build/native "" || pick_largest target "")" \
-                || err "Native build produced nothing"
-            is_executable "$BIN" || err "Native artifact is not executable"
-            cp "$BIN" "$APP_DIR/app"
-            echo "native" > "$META_DIR/type"
-            exit 0
-        fi
-        $CMD --no-daemon clean build -x test
-        ;;
-    ant)
-        ant clean jar war build 2>/dev/null || ant
-        ;;
-esac
-
-###############################################################################
-# Artifact classification
-###############################################################################
-
-WAR="$(pick_largest . war || true)"
-if [ -n "${WAR:-}" ]; then
-    log "WAR detected: $(basename "$WAR")"
-    cp "$WAR" "$APP_DIR/app.war"
-    echo "war" > "$META_DIR/type"
-    exit 0
-fi
-
-JAR="$(pick_largest . jar || true)"
-[ -n "$JAR" ] || err "No JAR artifacts produced"
-
-MAIN_CLASS="$(get_main_class "$JAR" || true)"
-
-if has_spring_boot_loader "$JAR" || [ -n "$MAIN_CLASS" ]; then
-    log "Executable JAR detected: $(basename "$JAR")"
-    cp "$JAR" "$APP_DIR/app.jar"
-    echo "jar" > "$META_DIR/type"
-    [ -n "$MAIN_CLASS" ] && echo "$MAIN_CLASS" > "$META_DIR/main_class"
-    exit 0
-fi
-
-###############################################################################
-# Thin JAR fallback
-###############################################################################
-
-log "Thin JAR detected — assembling classpath"
-
-cp "$JAR" "$APP_DIR/app.jar"
-
-for d in target/lib target/dependency build/libs/lib build/install/*/lib; do
-    if [ -d "$d" ]; then
-        log "Collecting deps from $d"
-        cp -L "$d"/*.jar "$LIB_DIR/" 2>/dev/null || true
-    fi
-done
-
-echo "classpath" > "$META_DIR/type"
-[ -n "$MAIN_CLASS" ] && echo "$MAIN_CLASS" > "$META_DIR/main_class"
-
-###############################################################################
-# Runtime launcher
-###############################################################################
-
-cat > "$APP_DIR/run.sh" << 'EOS'
-#!/bin/sh
-set -e
-BASE="$(cd "$(dirname "$0")" && pwd)"
-cd "$BASE"
-
-FOUND_CLASS="$(cat ../meta/main_class 2>/dev/null || true)"
-ACTUAL_MAIN="${MAIN_CLASS:-$FOUND_CLASS}"
-
-if [ -z "$ACTUAL_MAIN" ]; then
-    echo "[ERROR] Main-Class not found. Set MAIN_CLASS env var."
-    exit 1
-fi
-
-exec java ${JAVA_OPTS:-} -cp "app.jar:lib/*" "$ACTUAL_MAIN" "$@"
-EOS
-
-chmod +x "$APP_DIR/run.sh"
-log "Build complete. Type: $(cat "$META_DIR/type")"
-EOF
-
-# Verify artifact was created
-RUN ls -lah ./dexfile-artifact/ && \
-    ([ -f "./dexfile-artifact/app" ] || [ -f "./dexfile-artifact/app.jar" ] || [ -f "./dexfile-artifact/app.war" ]) || \
-    (echo "ERROR: No artifact found after build" >&2 && exit 1)
+    /usr/local/bin/build-deps.sh
 
 # ============================================================================
 # RUNTIME BASE STAGE
