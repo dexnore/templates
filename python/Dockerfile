@@ -1,436 +1,682 @@
 # syntax=dexnore/dexfile:0
 
-# This Dockerfile uses Dexfile syntax. For more information, see:
-# https://github.com/dexnore/dexfile
-
-ARG BUILD_IMAGE RUN_IMAGE
-WORKDIR /home/dexfile/app
-PROC --mount=target=. find . -type f 2>/dev/null | grep -m1 \
-    -e 'requirements' \
-    -e 'poetry.lock' \
-    -e 'Pipfile.lock' \
-    -e 'pdm.lock' \
-    -e 'uv.lock' \
-    -e 'environment.yml' \
-    -e 'environment.yaml' \
-    -e 'pyproject.toml' \
-    -e 'setup.py' \
-    -e 'setup.cfg' \
-    >/dev/null; then \
-        echo "Python project detected"; \
-    else \
-        echo "Not a python project" >&2; \
-        exit 1; \
-    fi
-
-IF PROC --mount=target=. if [ -n "${BUILD_IMAGE}" ]; then \
-        echo "BUILD_IMAGE is already set — refusing to auto-detect Python version." >&2; \
-        exit 1; \
-    fi; \
-    PYTHON_IMAGE_SUFFIX="${PYTHON_IMAGE_SUFFIX:-"-slim"}"; \
-    VERSIONS=""; \
-    for FILE in $(find . -type f \( \
-        -name ".python-version" -o \
-        -name "pyproject.toml" -o \
-        -name "setup.py" -o \
-        -name "Pipfile" \
-    \) 2>/dev/null); do \
-        case "$FILE" in \
-            *.python-version) \
-                PYTHON_VERSION=$(cat "$FILE" | tr -d ' \t\r'); \
-                ;; \
-            *pyproject.toml) \
-                RAW=$(grep -E "requires-python" "$FILE" 2>/dev/null || true); \
-                PYTHON_VERSION=$(echo "$RAW" | sed 's/.*=//g' | tr -d '" ' | \
-                    tr ',' '\n' | grep -Eo '[0-9]+\.[0-9]+' | sort -V | tail -n 1); \
-                ;; \
-            *setup.py) \
-                RAW=$(grep -E "python_requires" "$FILE" 2>/dev/null || true); \
-                PYTHON_VERSION=$(echo "$RAW" | sed 's/.*=//g' | tr -d '" ,' | \
-                    tr ',' '\n' | grep -Eo '[0-9]+\.[0-9]+' | sort -V | tail -n 1); \
-                ;; \
-            *Pipfile) \
-                RAW=$(grep -A1 "\[requires\]" "$FILE" 2>/dev/null | grep "python_version" || true); \
-                PYTHON_VERSION=$(echo "$RAW" | sed 's/.*=//g' | tr -d '" ' | \
-                    tr ',' '\n' | grep -Eo '[0-9]+\.[0-9]+' | sort -V | tail -n 1); \
-                ;; \
-        esac; \
-        [ -n "$PYTHON_VERSION" ] && VERSIONS="$VERSIONS $PYTHON_VERSION"; \
-    done; \
-    CLEANED=$(echo "$VERSIONS" | sed 's/[<>=!~]//g'); \
-    REQUIRED=$(echo "$CLEANED" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+' | sort -V | tail -n 1); \
-    if [ -n "$REQUIRED" ]; then \
-        echo "${REQUIRED}${PYTHON_IMAGE_SUFFIX}"; \
-    else \
-        echo "No valid Python version found in project files." >&2; \
-        exit 1; \
-    fi
-
-    ARG BUILD_IMAGE=python:${STDOUT:-latest}
-    IF PROC [ -z "${RUN_IMAGE}" ]
-        ARG RUN_IMAGE=${BUILD_IMAGE}
-    ENDIF
-ENDIF
-
-IF PROC --mount=target=. [ -f "environment.yml" ]
-    ARG BUILD_IMAGE=continuumio/miniconda3
-ENDIF
+# ========================================================================================
+# Universal Production-Ready Python Dexfile
+# ========================================================================================
+# Supports:
+# - Runtimes: CPython, PyPy, GraalPy
+# - Package Managers: pip, poetry, pipenv, uv, pdm, hatch, rye, conda/mamba
+# - Frameworks: Django, FastAPI, Flask, Litestar, Starlette, Quart, Sanic, Tornado, Pyramid
+# - ASGI Servers: Uvicorn, Hypercorn, Daphne, Granian
+# - WSGI Servers: Gunicorn, uWSGI, Waitress
+# - Task Queues: Celery, RQ, Dramatiq, Huey, Taskiq
+# - Web Servers: Nginx, Caddy (as reverse proxy)
+# ========================================================================================
 
 # ========================
-# Stage 1: Base image
+# Meta Stage: Global Args
 # ========================
-FROM ${BUILD_IMAGE:-python:3.12-slim} AS base
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive \
-    PATH=/opt/conda/envs/app/bin:$PATH:$HOME/.local/bin
-
-WORKDIR /home/dexfile/app
-
-# Install system dependencies + Python tools
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc curl && \
-    pip install --upgrade pip && \
-    pip install pipenv uv && \
-    curl -sSL https://install.python-poetry.org | python3 - && \
-    rm -rf /var/lib/apt/lists/*
+ARG PYTHON_VERSION=3.12
+ARG RUNTIME_TYPE=cpython
+ARG BASE_OS=debian
+ARG PACKAGE_MANAGER=auto
+ARG FRAMEWORK=auto
+ARG SERVER=auto
+ARG PORT=8000
+ARG WORKERS=auto
+ARG ENABLE_CELERY=auto
+ARG ENABLE_NGINX=false
 
 # ========================
-# Stage 2: Dependency caching
+# Stage 0: Project Validation
 # ========================
-FROM base AS deps
+FROM busybox:latest AS validator
 
-# Copy only dependency definition files for caching
-COPY pyproject.toml poetry.lock* Pipfile* Pipfile.lock* \
-     uv.lock* requirements.txt* environment.yml* environment.yaml* setup.py* setup.cfg* /home/dexfile/app/
-
-# Build wheels / install dependencies  // ~/.cache/pip
-RUN --mount=type=cache,target=wheels \
-    --mount=type=cache,target=/root/.cache/pip \
-    --mount=type=cache,target=/opt/conda/pkgs \
-    set -eux; \
-    echo ">>> Starting dependency resolution and wheel build"; \
-    mkdir -p wheels; \
-    \
-    # --- Conda Environment ---
-    if [ -f environment.yml ]; then \
-        echo "Detected Conda environment.yml..."; \
-        conda env create -f environment.yml --quiet; \
-        conda clean --all --yes; \
-    elif [ -f environment.yaml ]; then \
-        echo "Detected Conda environment.yaml..."; \
-        conda env create -f environment.yaml --quiet; \
-        conda clean --all --yes; \
-    \
-    # --- Pipenv ---
-    elif [ -f Pipfile ] && [ -f Pipfile.lock ]; then \
-        echo "Detected Pipenv..."; \
-        pipenv install --deploy --system; \
-        echo "Building wheels for installed packages..."; \
-        pip freeze | grep -v "^-e" > /tmp/requirements.installed.txt; \
-        pip wheel --no-cache-dir --no-deps --wheel-dir wheels -r /tmp/requirements.installed.txt; \
-    \
-    # --- Poetry ---
-    elif [ -f poetry.lock ] && [ -f pyproject.toml ]; then \
-        echo "Detected Poetry..."; \
-        if command -v poetry >/dev/null 2>&1; then \
-            poetry config virtualenvs.create false; \
-            poetry install --no-root; \
-            poetry build -f wheel; \
-            cp dist/*.whl wheels/; \
-            echo "Building wheels for installed packages..."; \
-            pip freeze | grep -v "^-e" > /tmp/requirements.installed.txt; \
-            pip wheel --no-cache-dir --no-deps --wheel-dir wheels -r /tmp/requirements.installed.txt; \
-        else \
-            echo "Error: poetry not installed or not in PATH." >&2; \
-            exit 1; \
-        fi; \
-    \
-    # --- UV ---
-    elif [ -f uv.lock ]; then \
-        echo "Detected UV..."; \
-        uv install; \
-        echo "Building wheels for installed packages..."; \
-        pip freeze | grep -v "^-e" > /tmp/requirements.installed.txt; \
-        pip wheel --no-cache-dir --no-deps --wheel-dir wheels -r /tmp/requirements.installed.txt; \
-    \
-    # --- Plain Requirements.txt ---
-    elif [ -f requirements.txt ]; then \
-        echo "Detected requirements.txt..."; \
-        pip wheel --no-cache-dir --no-deps --wheel-dir wheels -r requirements.txt; \
-    \
-    # --- No recognized dependency file ---
-    else \
-        echo "No recognized dependency file found (expected environment.yml, Pipfile, poetry.lock, uv.lock, or requirements.txt)." >&2; \
-        exit 1; \
-    fi; \
-    echo ">>> Wheel build completed and cached successfully."
-
-# ========================
-# Stage 3: Installer (final runtime)
-# ========================
-FROM ${BUILD_IMAGE:-python:3.12-slim} AS installer
-WORKDIR /home/dexfile/app
-
-# Copy wheels + dependency files
-COPY --from=deps /home/dexfile/app/wheels /home/dexfile/app/wheels
-COPY --from=deps pyproject.toml* setup.py* setup.cfg* requirements.txt* uv.lock* \
-     environment.yml* environment.yaml* /home/dexfile/app/
-
-# Install dependencies from wheels (cached)
-RUN set -eux; \
-    if [ -f environment.yml ] || [ -f environment.yaml ]; then \
-        echo "Conda environment already installed"; \
-    elif [ -d wheels ] && [ "$(ls -A wheels)" ]; then \
-        pip install --no-cache-dir wheels/*; \
-    elif [ -f pyproject.toml ]; then \
-        pip install --no-cache-dir .; \
-    else \
-        echo "Nothing to install"; exit 1; \
-    fi; \
-    pip cache purge || true
-
-# ========================
-# Stage 4: Builder (copy source)
-# ========================
-FROM installer AS builder
-# Only copy application source code to leverage dependency caching
+WORKDIR /validate
 COPY . .
 
-# ========================
-# Stage 5: Prod image (FIXED)
-# ========================
-FROM installer AS prod
-
-RUN groupadd -r dexnore && useradd -r -g dexnore dexfile
-WORKDIR /home/dexfile/app
-USER dexfile:dexnore
-
-COPY . /home/dexfile/app
-
-# ------------------------
-# Create python-entrypoint.py dynamically (full script)
-# ------------------------
-RUN mkdir -p /usr/local/bin
-COPY <<'EOF' /usr/local/bin/python-entrypoint.py
-#!/usr/bin/env python3
-"""
-Auto-detects FastAPI/Flask/Django/CLI apps and selects the best server.
-"""
-
-import os
-import sys
-import logging
-import multiprocessing
-import pathlib
-import importlib.util
-import subprocess
-import re
-from typing import List, Optional, Union, Callable
-
-# ------------------- Logging -------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
-
-PROJECT_DIR = pathlib.Path(os.environ.get("PROJECT_DIR", ".")).resolve()
-HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", 8000))
-BIND = f"{HOST}:{PORT}"
-DEV_RELOAD = os.environ.get("DEV_RELOAD", "false").lower() == "true"
-DEV_SSL = os.environ.get("DEV_SSL", "false").lower() == "true"
-HTTPS_CERT = os.environ.get("HTTPS_CERT")
-HTTPS_KEY = os.environ.get("HTTPS_KEY")
-MAIN_FILE_OVERRIDE = os.environ.get("MAIN_FILE")
-AUTO_INSTALL_SERVERS = os.environ.get("AUTO_INSTALL_SERVERS", "false").lower() == "true"
-
-EXCLUDE_DIRS = {'.venv', '.env', '__pycache__', '.mypy_cache', '.pytest_cache', '.git', '.tox', '.eggs', 'build', 'dist'}
-COMMON_ENTRYPOINT_NAMES = ["app.py", "main.py", "run.py", "server.py", "manage.py", "cli.py"]
-
-# ------------------- Utilities -------------------
-def parse_gunicorn_config(var_name: str) -> Optional[str]:
-    config_path = PROJECT_DIR / "gunicorn.conf.py"
-    if not config_path.exists(): return None
-    pattern = re.compile(
-        rf"^[ \t]*{re.escape(var_name)}[ \t]*=[ \t]*(['\"]?)(.+?)\1[ \t]*(\#.*)?$",
-        re.MULTILINE | re.IGNORECASE | re.DOTALL
-    )
-    try:
-        content = config_path.read_text(errors="ignore")
-        match = pattern.search(content)
-        if match:
-            return match.group(2).strip()
-    except Exception as e:
-        logger.warning(f"Failed to parse gunicorn config variable '{var_name}': {e}")
-    return None
-
-def get_gunicorn_option(env_var: str, file_var: str, default: any, cast_func: Callable) -> any:
-    env_value = os.environ.get(env_var)
-    if env_value is not None:
-        try: return cast_func(env_value)
-        except ValueError: logger.warning(f"Invalid ENV {env_var}='{env_value}', using default.")
-    file_value = parse_gunicorn_config(file_var)
-    if file_value is not None:
-        try: return cast_func(file_value)
-        except ValueError: logger.warning(f"Invalid config {file_var}='{file_value}', using default.")
-    return default
-
-CPU_CORES = multiprocessing.cpu_count()
-WORKERS = get_gunicorn_option("WORKERS", "workers", CPU_CORES * 2 + 1, int)
-TIMEOUT = get_gunicorn_option("TIMEOUT", "timeout", 30, int)
-PRELOAD = get_gunicorn_option("PRELOAD", "preload_app", "false", lambda x: x.lower() == "true")
-WORKER_CLASS = get_gunicorn_option("WORKER_CLASS", "worker_class", "sync", str)
-ACCESS_LOG = get_gunicorn_option("ACCESSLOG", "accesslog", "-", str)
-ERROR_LOG = get_gunicorn_option("ERRORLOG", "errorlog", "-", str)
-
-def is_installed(pkg: str) -> bool:
-    return importlib.util.find_spec(pkg) is not None
-
-def install_package(pkg: str) -> bool:
-    if AUTO_INSTALL_SERVERS:
-        logger.info(f"Installing missing package '{pkg}'...")
-        try: subprocess.check_call([sys.executable, "-m", "pip", "install", pkg]); return True
-        except subprocess.CalledProcessError: logger.error(f"Failed to install '{pkg}'"); return False
-    return False
-
-def find_python_files(project_dir: pathlib.Path) -> List[pathlib.Path]:
-    files = []
-    for f in project_dir.rglob("*.py"):
-        if not any(part in EXCLUDE_DIRS for part in f.parts[len(project_dir.parts):]):
-            files.append(f)
-    return files
-
-# ------------------- Entrypoint Detection -------------------
-def select_entrypoint(files: List[pathlib.Path]) -> Union[pathlib.Path, str]:
-    if MAIN_FILE_OVERRIDE:
-        path_override = PROJECT_DIR / MAIN_FILE_OVERRIDE
-        if path_override.exists(): return path_override
-        logger.warning(f"MAIN_FILE override '{MAIN_FILE_OVERRIDE}' not found. Falling back.")
-        
-    scores = {}
-    for f in files:
-        score = 0
-        name = f.name
-        text = f.read_text(errors="ignore")
-        depth = len(f.relative_to(PROJECT_DIR).parts) - 1
-        
-        score += max(0, 5 - depth)
-        if re.search(r"if\s+__name__\s*==\s*['\"]__main__['\"]:", text): score += 10
-        if any(k in text for k in ["from fastapi", "import fastapi", "from flask", "import flask"]): score += 20
-        if any(k in text for k in ["uvicorn.run(", "hypercorn.run(", "daphne.run("]): score += 30
-        if any(k in text for k in ["django.core.management", "django-admin"]): score += 30
-        if any(k in text for k in ["import argparse", "import click", "import typer"]): score += 15
-        
-        if name == "app.py": score += 25
-        elif name == "main.py": score += 20
-        elif name in ("run.py", "server.py"): score += 15
-        elif name in ("manage.py", "cli.py"): score += 20
-        
-        scores[f] = score
-    
-    if scores and max(scores.values()) > 0: return max(scores, key=scores.get)
-
-    for name in COMMON_ENTRYPOINT_NAMES:
-        candidate = PROJECT_DIR / name
-        if candidate.exists(): return candidate
-    
-    pkg_main = list(PROJECT_DIR.rglob("__main__.py"))
-    if pkg_main: return f"__MODULE_EXEC__:{pkg_main[0].parent.name}"
-    
-    raise FileNotFoundError("No suitable Python entrypoint found.")
-
-# ------------------- Framework Detection -------------------
-def detect_framework_and_app(file_path: pathlib.Path):
-    text = file_path.read_text(errors="ignore")
-    if re.search(r"(from|import)\s+fastapi", text):
-        m = re.search(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*[:=]\s*FastAPI\(", text)
-        return "fastapi", m.group(1) if m else "app"
-    if re.search(r"(from|import)\s+flask", text):
-        m = re.search(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*[:=]\s*Flask\(", text)
-        return "flask", m.group(1) if m else "app"
-    if "django.core.management" in text or "django-admin" in text: return "django", None
-    if any(k in text for k in ["import argparse", "import click", "import typer"]): return "cli", None
-    return None, None
-
-# ------------------- Command Builder -------------------
-def build_cmd(framework: str, entrypoint: pathlib.Path, app_var: Optional[str]) -> List[str]:
-    module_path = ".".join(entrypoint.relative_to(PROJECT_DIR).with_suffix("").parts)
-    app_string = f"{module_path}:{app_var}" if app_var else ""
-    ssl_args = []
-    if HTTPS_CERT and HTTPS_KEY: ssl_args = ["--ssl-certfile", HTTPS_CERT, "--ssl-keyfile", HTTPS_KEY]
-    elif DEV_SSL: logger.warning("DEV_SSL enabled but no certificates provided. Skipping SSL.")
-    worker_class_to_use = WORKER_CLASS
-
-    if framework == "cli" or (app_var is None and framework not in ("fastapi", "flask", "django")):
-        return [sys.executable, str(entrypoint)]
-
-    if framework == "fastapi" and worker_class_to_use.lower() == "sync":
-        worker_class_to_use = "uvicorn.workers.UvicornWorker"
-
-    if framework == "django":
-        wsgi_files = list(PROJECT_DIR.rglob("wsgi.py"))
-        if not wsgi_files:
-            logger.warning("Django project detected but no 'wsgi.py' found. Running entrypoint as script.")
-            return [sys.executable, str(entrypoint)]
-        wsgi_file = wsgi_files[0]
-        wsgi_module = ".".join(wsgi_file.relative_to(PROJECT_DIR).with_suffix("").parts)
-        app_string = f"{wsgi_module}:application"
-        if worker_class_to_use.lower() in ("uvicorn.workers.uvicornworker", "gunicorn.workers.gthread"):
-            worker_class_to_use = "sync"
-
-    server_candidates = ["gunicorn", "uvicorn", "hypercorn"]
-
-    for server in server_candidates:
-        if not (is_installed(server) or install_package(server)): continue
-        if server == "gunicorn":
-            cmd = ["gunicorn", app_string, "-w", str(WORKERS), "-k", worker_class_to_use,
-                   "--bind", BIND, "--timeout", str(TIMEOUT),
-                   "--access-logfile", ACCESS_LOG, "--error-logfile", ERROR_LOG]
-            if PRELOAD: cmd.append("--preload")
-            return cmd + [s.replace('--ssl-', '--') for s in ssl_args]
-        if framework == "fastapi":
-            if server == "uvicorn":
-                cmd = ["uvicorn", app_string, "--host", HOST, "--port", str(PORT), "--workers", str(WORKERS)]
-                if DEV_RELOAD: cmd.append("--reload")
-                return cmd + ssl_args
-            elif server == "hypercorn":
-                cmd = ["hypercorn", app_string, "--bind", BIND, "--workers", str(WORKERS)]
-                return cmd + [s.replace('--ssl-', '--') for s in ssl_args]
-
-    if framework in ("fastapi", "flask", "django"):
-        sys.exit(f"FATAL: {framework} detected but no production ASGI/WSGI server is installed.")
-
-    return [sys.executable, str(entrypoint)]
-
-# ------------------- Main -------------------
-def main():
-    python_files = find_python_files(PROJECT_DIR)
-    if not python_files: sys.exit(f"No Python files found in {PROJECT_DIR}")
-    try: entrypoint = select_entrypoint(python_files)
-    except FileNotFoundError as e: sys.exit(e)
-    if isinstance(entrypoint,str) and entrypoint.startswith("__MODULE_EXEC__"):
-        pkg_name = entrypoint.split(":")[1]
-        cmd = [sys.executable,"-m",pkg_name]; framework="module"
-    else:
-        framework, app_var = detect_framework_and_app(entrypoint)
-        cmd = build_cmd(framework, entrypoint, app_var)
-    logger.info(f"Entrypoint selected: {entrypoint}")
-    logger.info(f"Framework detected: {framework or 'unknown'}")
-    logger.info(f"Starting command: {' '.join(cmd)}")
-    os.execvp(cmd[0], cmd)
-
-if __name__ == "__main__": main()
-EOF
-
-RUN chmod +x /usr/local/bin/python-entrypoint.py
-
-ENTRYPOINT ["/usr/local/bin/python-entrypoint.py"]
+# Validate Python project exists
+RUN if ! find . -maxdepth 3 -type f \( \
+        -name "*.py" -o \
+        -name "pyproject.toml" -o \
+        -name "requirements.txt" -o \
+        -name "setup.py" -o \
+        -name "Pipfile" -o \
+        -name "environment.yml" -o \
+        -name "poetry.lock" -o \
+        -name "uv.lock" -o \
+        -name "pdm.lock" \
+    \) 2>/dev/null | grep -q .; then \
+        echo "❌ ERROR: No Python project files found" >&2; \
+        exit 1; \
+    fi && \
+    echo "✅ Python project validated"
 
 # ========================
-# Stage 6: Release image
+# Stage 1: Python Version Detection
 # ========================
-FROM prod AS release
-EXPOSE ${PORT:-3000}
-LABEL maintainer="@dexnore/dexfile"
-LABEL moby.buildkit.frontend.network.none="true"
-LABEL moby.buildkit.frontend.caps="moby.buildkit.frontend.inputs,moby.buildkit.frontend.subrequests,moby.buildkit.frontend.contexts"
+FROM busybox:latest AS python-version-detector
+
+WORKDIR /detect
+COPY . .
+
+RUN sh -c ' \
+    VERSION=""; \
+    \
+    if [ -f ".python-version" ]; then \
+        VERSION=$(cat .python-version | head -1 | tr -d " \t\r\n" | grep -oE "[0-9]+\.[0-9]+"); \
+        echo "Detected from .python-version: $VERSION"; \
+    fi; \
+    \
+    if [ -z "$VERSION" ] && [ -f "pyproject.toml" ]; then \
+        VERSION=$(grep -oP "requires-python\s*=\s*\"\K[^\"]*" pyproject.toml | grep -oE "[0-9]+\.[0-9]+" | sort -V | tail -1); \
+        [ -n "$VERSION" ] && echo "Detected from pyproject.toml: $VERSION"; \
+    fi; \
+    \
+    if [ -z "$VERSION" ] && [ -f "setup.py" ]; then \
+        VERSION=$(grep -oP "python_requires\s*=\s*[\x27\"]?\K[^\x27\"]*" setup.py | grep -oE "[0-9]+\.[0-9]+" | sort -V | tail -1); \
+        [ -n "$VERSION" ] && echo "Detected from setup.py: $VERSION"; \
+    fi; \
+    \
+    if [ -z "$VERSION" ] && [ -f "Pipfile" ]; then \
+        VERSION=$(grep -A5 "\[requires\]" Pipfile | grep -oP "python_version\s*=\s*\"\K[^\"]*" | head -1); \
+        [ -n "$VERSION" ] && echo "Detected from Pipfile: $VERSION"; \
+    fi; \
+    \
+    if [ -z "$VERSION" ] && [ -f "runtime.txt" ]; then \
+        VERSION=$(grep -oP "python-\K[0-9]+\.[0-9]+" runtime.txt | head -1); \
+        [ -n "$VERSION" ] && echo "Detected from runtime.txt: $VERSION"; \
+    fi; \
+    \
+    if [ -z "$VERSION" ] && [ -f "tox.ini" ]; then \
+        VERSION=$(grep -oP "py[0-9]+" tox.ini | head -1 | sed "s/py//; s/\([0-9]\)\([0-9]\)/\1.\2/"); \
+        [ -n "$VERSION" ] && echo "Detected from tox.ini: $VERSION"; \
+    fi; \
+    \
+    if [ -z "$VERSION" ]; then \
+        VERSION="3.12"; \
+        echo "No version found, defaulting to: $VERSION"; \
+    fi; \
+    \
+    echo "$VERSION" > /detect/python_version.txt; \
+    cat /detect/python_version.txt'
+
+# ========================
+# Stage 2: Runtime Type Detection
+# ========================
+FROM busybox:latest AS runtime-detector
+
+WORKDIR /detect
+COPY . .
+
+RUN sh -c ' \
+    RUNTIME="cpython"; \
+    \
+    if [ -f ".python-version" ]; then \
+        CONTENT=$(cat .python-version); \
+        if echo "$CONTENT" | grep -qi "pypy"; then \
+            RUNTIME="pypy"; \
+        elif echo "$CONTENT" | grep -qi "graalpy"; then \
+            RUNTIME="graalpy"; \
+        fi; \
+    fi; \
+    \
+    echo "$RUNTIME" > /detect/runtime_type.txt; \
+    echo "Detected runtime: $RUNTIME"'
+
+# ========================
+# Stage 3: Package Manager Detection
+# ========================
+FROM busybox:latest AS package-manager-detector
+
+WORKDIR /detect
+COPY . .
+
+RUN sh -c ' \
+    PM=""; \
+    \
+    if [ -f "uv.lock" ]; then \
+        PM="uv"; \
+    elif [ -f "rye.lock" ]; then \
+        PM="rye"; \
+    elif [ -f "pdm.lock" ]; then \
+        PM="pdm"; \
+    elif [ -f "poetry.lock" ]; then \
+        PM="poetry"; \
+    elif [ -f "Pipfile.lock" ] || [ -f "Pipfile" ]; then \
+        PM="pipenv"; \
+    elif [ -f "environment.yml" ] || [ -f "environment.yaml" ]; then \
+        PM="conda"; \
+    elif [ -f "pyproject.toml" ]; then \
+        if grep -q "\[tool.hatch\]" pyproject.toml 2>/dev/null; then \
+            PM="hatch"; \
+        elif grep -q "\[tool.rye\]" pyproject.toml 2>/dev/null; then \
+            PM="rye"; \
+        elif grep -q "\[tool.pdm\]" pyproject.toml 2>/dev/null; then \
+            PM="pdm"; \
+        elif grep -q "\[tool.poetry\]" pyproject.toml 2>/dev/null; then \
+            PM="poetry"; \
+        elif grep -q "\[tool.uv\]" pyproject.toml 2>/dev/null; then \
+            PM="uv"; \
+        else \
+            PM="pip"; \
+        fi; \
+    elif [ -f "requirements.txt" ] || [ -d "requirements" ]; then \
+        PM="pip"; \
+    elif [ -f "setup.py" ] || [ -f "setup.cfg" ]; then \
+        PM="pip"; \
+    else \
+        echo "❌ ERROR: No package manager detected" >&2; \
+        exit 1; \
+    fi; \
+    \
+    echo "$PM" > /detect/package_manager.txt; \
+    echo "Detected package manager: $PM"'
+
+# ========================
+# Stage 4: Framework Detection
+# ========================
+FROM busybox:latest AS framework-detector
+
+WORKDIR /detect
+COPY . .
+
+RUN sh -c ' \
+    FRAMEWORK="generic"; \
+    \
+    FILES=$(find . -maxdepth 2 -type f \( \
+        -name "pyproject.toml" -o \
+        -name "setup.py" -o \
+        -name "setup.cfg" -o \
+        -name "requirements.txt" -o \
+        -name "Pipfile" \
+    \) 2>/dev/null); \
+    \
+    if echo "$FILES" | xargs grep -l "django\|Django" 2>/dev/null | grep -q .; then \
+        FRAMEWORK="django"; \
+    elif echo "$FILES" | xargs grep -l "fastapi\|FastAPI" 2>/dev/null | grep -q .; then \
+        FRAMEWORK="fastapi"; \
+    elif echo "$FILES" | xargs grep -l "litestar\|Litestar" 2>/dev/null | grep -q .; then \
+        FRAMEWORK="litestar"; \
+    elif echo "$FILES" | xargs grep -l "flask\|Flask" 2>/dev/null | grep -q .; then \
+        FRAMEWORK="flask"; \
+    elif echo "$FILES" | xargs grep -l "quart\|Quart" 2>/dev/null | grep -q .; then \
+        FRAMEWORK="quart"; \
+    elif echo "$FILES" | xargs grep -l "sanic\|Sanic" 2>/dev/null | grep -q .; then \
+        FRAMEWORK="sanic"; \
+    elif echo "$FILES" | xargs grep -l "tornado\|Tornado" 2>/dev/null | grep -q .; then \
+        FRAMEWORK="tornado"; \
+    elif echo "$FILES" | xargs grep -l "pyramid\|Pyramid" 2>/dev/null | grep -q .; then \
+        FRAMEWORK="pyramid"; \
+    elif echo "$FILES" | xargs grep -l "starlette\|Starlette" 2>/dev/null | grep -q .; then \
+        FRAMEWORK="starlette"; \
+    fi; \
+    \
+    echo "$FRAMEWORK" > /detect/framework.txt; \
+    echo "Detected framework: $FRAMEWORK"'
+
+# ========================
+# Stage 5: Server Detection
+# ========================
+FROM busybox:latest AS server-detector
+
+WORKDIR /detect
+COPY --from=framework-detector /detect/framework.txt ./
+COPY . .
+
+RUN sh -c ' \
+    FRAMEWORK=$(cat framework.txt); \
+    SERVER="uvicorn"; \
+    \
+    FILES=$(find . -maxdepth 2 -type f \( \
+        -name "pyproject.toml" -o \
+        -name "requirements.txt" -o \
+        -name "Pipfile" \
+    \) 2>/dev/null); \
+    \
+    if [ "$FRAMEWORK" = "django" ]; then \
+        if echo "$FILES" | xargs grep -l "channels\|daphne" 2>/dev/null | grep -q .; then \
+            SERVER="daphne"; \
+        else \
+            SERVER="gunicorn"; \
+        fi; \
+    elif [ "$FRAMEWORK" = "fastapi" ] || [ "$FRAMEWORK" = "litestar" ] || [ "$FRAMEWORK" = "starlette" ]; then \
+        if echo "$FILES" | xargs grep -l "granian" 2>/dev/null | grep -q .; then \
+            SERVER="granian"; \
+        elif echo "$FILES" | xargs grep -l "hypercorn" 2>/dev/null | grep -q .; then \
+            SERVER="hypercorn"; \
+        else \
+            SERVER="uvicorn"; \
+        fi; \
+    elif [ "$FRAMEWORK" = "flask" ] || [ "$FRAMEWORK" = "pyramid" ]; then \
+        if echo "$FILES" | xargs grep -l "waitress" 2>/dev/null | grep -q .; then \
+            SERVER="waitress"; \
+        elif echo "$FILES" | xargs grep -l "uwsgi" 2>/dev/null | grep -q .; then \
+            SERVER="uwsgi"; \
+        else \
+            SERVER="gunicorn"; \
+        fi; \
+    elif [ "$FRAMEWORK" = "sanic" ]; then \
+        SERVER="sanic"; \
+    elif [ "$FRAMEWORK" = "tornado" ]; then \
+        SERVER="tornado"; \
+    elif [ "$FRAMEWORK" = "quart" ]; then \
+        SERVER="hypercorn"; \
+    fi; \
+    \
+    echo "$SERVER" > /detect/server.txt; \
+    echo "Detected server: $SERVER"'
+
+# ========================
+# Stage 6: Task Queue Detection
+# ========================
+FROM busybox:latest AS celery-detector
+
+WORKDIR /detect
+COPY . .
+
+RUN sh -c ' \
+    ENABLE_CELERY="false"; \
+    \
+    FILES=$(find . -maxdepth 2 -type f \( \
+        -name "pyproject.toml" -o \
+        -name "requirements.txt" -o \
+        -name "Pipfile" \
+    \) 2>/dev/null); \
+    \
+    if echo "$FILES" | xargs grep -l "celery\|Celery\|rq\|dramatiq\|huey\|taskiq" 2>/dev/null | grep -q .; then \
+        ENABLE_CELERY="true"; \
+    fi; \
+    \
+    echo "$ENABLE_CELERY" > /detect/celery.txt; \
+    echo "Celery/Task queue enabled: $ENABLE_CELERY"'
+
+# ========================
+# Stage 7: Base Image Selection
+# ========================
+COPY --from=python-version-detector /detect/python_version.txt /tmp/
+COPY --from=runtime-detector /detect/runtime_type.txt /tmp/
+COPY --from=package-manager-detector /detect/package_manager.txt /tmp/
+
+PROC cat /tmp/python_version.txt
+ARG DETECTED_PYTHON_VERSION="${STDOUT}"
+
+PROC cat /tmp/runtime_type.txt
+ARG DETECTED_RUNTIME="${STDOUT}"
+
+PROC cat /tmp/package_manager.txt
+ARG DETECTED_PM="${STDOUT}"
+
+# Select base image
+IF RUN [ "${DETECTED_PM}" = "conda" ]
+    ARG BUILD_IMAGE="continuumio/miniconda3:latest"
+    ARG RUN_IMAGE="continuumio/miniconda3:latest"
+ELSE IF RUN [ "${DETECTED_RUNTIME}" = "pypy" ]
+    ARG BUILD_IMAGE="pypy:${DETECTED_PYTHON_VERSION}-slim"
+    ARG RUN_IMAGE="pypy:${DETECTED_PYTHON_VERSION}-slim"
+ELSE IF RUN [ "${BASE_OS}" = "alpine" ]
+    ARG BUILD_IMAGE="python:${DETECTED_PYTHON_VERSION}-alpine"
+    ARG RUN_IMAGE="python:${DETECTED_PYTHON_VERSION}-alpine"
+ELSE
+    ARG BUILD_IMAGE="python:${DETECTED_PYTHON_VERSION}-slim"
+    ARG RUN_IMAGE="python:${DETECTED_PYTHON_VERSION}-slim"
+ENDIF
+
+# ========================
+# Stage 8: Build Base
+# ========================
+FROM ${BUILD_IMAGE} AS base
+
+WORKDIR /app
+
+# Set Python environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    PATH="/root/.local/bin:/root/.cargo/bin:/root/.rye/shims:$PATH"
+
+# Install system dependencies
+IF RUN command -v apt-get >/dev/null 2>&1
+    RUN apt-get update && \
+        apt-get install -y --no-install-recommends \
+            gcc g++ make \
+            libpq-dev libmariadb-dev libsqlite3-dev \
+            libxml2-dev libxslt1-dev \
+            libjpeg-dev libpng-dev libfreetype6-dev \
+            libssl-dev libffi-dev \
+            curl wget git \
+            ca-certificates \
+            && apt-get clean && rm -rf /var/lib/apt/lists/*
+ELSE IF RUN command -v apk >/dev/null 2>&1
+    RUN apk add --no-cache \
+        gcc g++ make musl-dev linux-headers \
+        postgresql-dev mariadb-dev sqlite-dev \
+        libxml2-dev libxslt-dev \
+        jpeg-dev libpng-dev freetype-dev \
+        openssl-dev libffi-dev \
+        curl wget git \
+        ca-certificates
+ENDIF
+
+# Upgrade pip and install build tools
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# ========================
+# Stage 9: Package Manager Installation
+# ========================
+FROM base AS pm-installer
+
+COPY --from=package-manager-detector /detect/package_manager.txt /tmp/
+PROC cat /tmp/package_manager.txt
+ARG PM="${STDOUT}"
+
+# Install package managers
+RUN set -e; \
+    echo "Installing package manager: ${PM}"; \
+    if [ "${PM}" = "poetry" ]; then \
+        curl -sSL https://install.python-poetry.org | python3 -; \
+    elif [ "${PM}" = "pipenv" ]; then \
+        pip install pipenv; \
+    elif [ "${PM}" = "uv" ]; then \
+        curl -LsSf https://astral.sh/uv/install.sh | sh; \
+    elif [ "${PM}" = "pdm" ]; then \
+        pip install pdm; \
+    elif [ "${PM}" = "hatch" ]; then \
+        pip install hatch; \
+    elif [ "${PM}" = "rye" ]; then \
+        curl -sSf https://rye.astral.sh/get | bash; \
+    fi
+
+# ========================
+# Stage 10: Dependencies
+# ========================
+FROM pm-installer AS dependencies
+
+# Copy dependency files (all possible formats)
+COPY pyproject.toml setup.py setup.cfg requirements.txt requirements/ \
+     poetry.lock Pipfile Pipfile.lock pdm.lock uv.lock rye.lock \
+     environment.yml environment.yaml \
+     .python-version runtime.txt \
+     /app/ 2>/dev/null || true
+
+COPY --from=package-manager-detector /detect/package_manager.txt /tmp/
+PROC cat /tmp/package_manager.txt
+ARG PM="${STDOUT}"
+
+# Install dependencies with cache mounts
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/pypoetry \
+    --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/pdm \
+    set -e; \
+    echo "Installing dependencies with ${PM}..."; \
+    \
+    if [ "${PM}" = "uv" ]; then \
+        if [ -f "uv.lock" ]; then \
+            uv sync --frozen --no-dev; \
+        elif [ -f "pyproject.toml" ]; then \
+            uv pip install --system .; \
+        elif [ -f "requirements.txt" ]; then \
+            uv pip install --system -r requirements.txt; \
+        fi; \
+    elif [ "${PM}" = "pdm" ]; then \
+        pdm install --prod --no-lock --no-self; \
+    elif [ "${PM}" = "poetry" ]; then \
+        poetry config virtualenvs.create false; \
+        poetry install --only main --no-root --no-interaction; \
+    elif [ "${PM}" = "pipenv" ]; then \
+        pipenv install --system --deploy --ignore-pipfile; \
+    elif [ "${PM}" = "hatch" ]; then \
+        pip install -e .; \
+    elif [ "${PM}" = "rye" ]; then \
+        rye sync --no-dev; \
+    elif [ "${PM}" = "conda" ]; then \
+        if [ -f "environment.yml" ]; then \
+            conda env create -f environment.yml --name app --quiet; \
+        elif [ -f "environment.yaml" ]; then \
+            conda env create -f environment.yaml --name app --quiet; \
+        fi; \
+        conda clean --all --yes; \
+    elif [ "${PM}" = "pip" ]; then \
+        if [ -f "requirements.txt" ]; then \
+            pip install -r requirements.txt; \
+        elif [ -d "requirements" ]; then \
+            find requirements -name "*.txt" -exec pip install -r {} \;; \
+        elif [ -f "pyproject.toml" ]; then \
+            pip install .; \
+        elif [ -f "setup.py" ]; then \
+            pip install .; \
+        fi; \
+    fi
+
+# Install production server
+COPY --from=server-detector /detect/server.txt /tmp/
+PROC cat /tmp/server.txt
+ARG SERVER="${STDOUT}"
+
+RUN set -e; \
+    echo "Installing server: ${SERVER}"; \
+    if [ "${SERVER}" = "uvicorn" ]; then \
+        pip install "uvicorn[standard]" uvloop httptools; \
+    elif [ "${SERVER}" = "gunicorn" ]; then \
+        pip install gunicorn gevent; \
+    elif [ "${SERVER}" = "hypercorn" ]; then \
+        pip install hypercorn; \
+    elif [ "${SERVER}" = "daphne" ]; then \
+        pip install daphne; \
+    elif [ "${SERVER}" = "granian" ]; then \
+        pip install granian; \
+    elif [ "${SERVER}" = "waitress" ]; then \
+        pip install waitress; \
+    elif [ "${SERVER}" = "uwsgi" ]; then \
+        pip install uwsgi; \
+    fi
+
+# ========================
+# Stage 11: Builder
+# ========================
+FROM dependencies AS builder
+
+# Copy application code
+COPY . .
+
+COPY --from=framework-detector /detect/framework.txt /tmp/
+PROC cat /tmp/framework.txt
+ARG FRAMEWORK="${STDOUT}"
+
+# Framework-specific build steps
+IF RUN [ "${FRAMEWORK}" = "django" ]
+    RUN python manage.py collectstatic --noinput 2>/dev/null || \
+        echo "⚠️  No static files to collect"
+ENDIF
+
+IF RUN [ -f "setup.py" ] || [ -f "pyproject.toml" ]
+    RUN pip install -e . 2>/dev/null || true
+ENDIF
+
+# ========================
+# Stage 12: Runtime Image
+# ========================
+FROM ${RUN_IMAGE} AS runtime
+
+WORKDIR /app
+
+# Create non-root user
+RUN if command -v useradd >/dev/null 2>&1; then \
+        groupadd -r app && \
+        useradd -r -g app -d /app -s /bin/bash app; \
+    else \
+        addgroup -S app && \
+        adduser -S -D -h /app -s /bin/bash -G app app; \
+    fi && \
+    chown -R app:app /app
+
+# Set environment
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/home/app/.local/bin:$PATH" \
+    PORT=8000
+
+# Copy Python installation
+COPY --from=builder --chown=app:app /usr/local/lib/python*/site-packages /usr/local/lib/python*/site-packages
+COPY --from=builder --chown=app:app /usr/local/bin /usr/local/bin
+COPY --from=builder --chown=app:app /app /app
+
+# Framework-specific directories
+COPY --from=framework-detector /detect/framework.txt /tmp/
+PROC cat /tmp/framework.txt
+ARG FRAMEWORK="${STDOUT}"
+
+IF RUN [ "${FRAMEWORK}" = "django" ]
+    RUN mkdir -p /app/staticfiles /app/media && \
+        chown -R app:app /app/staticfiles /app/media
+ENDIF
+
+USER app
+
+EXPOSE 8000
+
+# ========================
+# Stage 13: Production
+# ========================
+FROM runtime AS production
+
+# Create intelligent entrypoint
+RUN cat > /app/entrypoint.sh <<'ENTRYPOINT'
+#!/bin/bash
+set -euo pipefail
+
+# Read detection results
+FRAMEWORK=$(cat /tmp/framework.txt 2>/dev/null || echo "generic")
+SERVER=$(cat /tmp/server.txt 2>/dev/null || echo "uvicorn")
+
+# Environment variables
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8000}"
+WORKERS="${WORKERS:-$(nproc)}"
+
+echo "🐍 Python Application Startup"
+echo "Framework: $FRAMEWORK"
+echo "Server: $SERVER"
+echo "Workers: $WORKERS"
+
+# Handle CLI commands
+if [ "$#" -gt 0 ]; then
+    exec "$@"
+fi
+
+# Determine application module
+if [ "$FRAMEWORK" = "django" ]; then
+    if [ -f "manage.py" ]; then
+        WSGI_MODULE=$(python -c "import os; print(os.environ.get('DJANGO_SETTINGS_MODULE', 'config.settings').rsplit('.', 1)[0] + '.wsgi:application')" 2>/dev/null || echo "config.wsgi:application")
+        APP_MODULE="$WSGI_MODULE"
+    else
+        echo "❌ Django detected but no manage.py found"
+        exit 1
+    fi
+else
+    # Try to find app module
+    if [ -f "main.py" ]; then
+        APP_MODULE="main:app"
+    elif [ -f "app.py" ]; then
+        APP_MODULE="app:app"
+    elif [ -f "asgi.py" ]; then
+        APP_MODULE="asgi:application"
+    elif [ -f "wsgi.py" ]; then
+        APP_MODULE="wsgi:application"
+    else
+        echo "⚠️  Could not auto-detect app module, using main:app"
+        APP_MODULE="main:app"
+    fi
+fi
+
+echo "App module: $APP_MODULE"
+
+# Start server
+case "$SERVER" in
+    uvicorn)
+        exec uvicorn "$APP_MODULE" \
+            --host "$HOST" \
+            --port "$PORT" \
+            --workers "$WORKERS" \
+            --loop uvloop \
+            --http httptools
+        ;;
+    gunicorn)
+        if [ "$FRAMEWORK" = "fastapi" ] || [ "$FRAMEWORK" = "litestar" ]; then
+            WORKER_CLASS="uvicorn.workers.UvicornWorker"
+        else
+            WORKER_CLASS="gevent"
+        fi
+        exec gunicorn "$APP_MODULE" \
+            --bind "$HOST:$PORT" \
+            --workers "$WORKERS" \
+            --worker-class "$WORKER_CLASS" \
+            --timeout 120 \
+            --access-logfile - \
+            --error-logfile -
+        ;;
+    hypercorn)
+        exec hypercorn "$APP_MODULE" \
+            --bind "$HOST:$PORT" \
+            --workers "$WORKERS"
+        ;;
+    daphne)
+        exec daphne \
+            -b "$HOST" \
+            -p "$PORT" \
+            "$APP_MODULE"
+        ;;
+    granian)
+        exec granian \
+            --host "$HOST" \
+            --port "$PORT" \
+            --workers "$WORKERS" \
+            --interface asgi \
+            "$APP_MODULE"
+        ;;
+    waitress)
+        exec waitress-serve \
+            --host="$HOST" \
+            --port="$PORT" \
+            "$APP_MODULE"
+        ;;
+    sanic)
+        exec python -m sanic "$APP_MODULE" \
+            --host="$HOST" \
+            --port="$PORT" \
+            --workers="$WORKERS"
+        ;;
+    *)
+        echo "⚠️  Unknown server, trying to run main.py"
+        if [ -f "main.py" ]; then
+            exec python main.py
+        else
+            echo "❌ No entrypoint found"
+            exit 1
+        fi
+        ;;
+esac
+ENTRYPOINT
+
+RUN chmod +x /app/entrypoint.sh
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${PORT}/health')" || exit 1
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD []
+
+# ========================
+# Stage 14: Release
+# ========================
+FROM production AS release
+
+LABEL org.opencontainers.image.title="Universal Python Application" \
+      org.opencontainers.image.description="Auto-detecting Python framework container" \
+      org.opencontainers.image.vendor="Dexnore" \
+      com.dexnore.auto-detect="true" \
+      com.dexnore.supports="django,fastapi,flask,litestar,generic"
