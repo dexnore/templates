@@ -401,9 +401,203 @@ FOR PORT IN RUN /usr/local/bin/nginx_custom_script.sh ports nginx.conf
     EXPOSE ${PORT}
 ENDFOR
 
+COPY <<-"EOF" /usr/local/bin/caddy_custom_script.sh
+#!/bin/sh
+set -eu
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+_visited_files=""
+
+is_visited() {
+    case " $_visited_files " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+inline_imports() {
+    file="$1"
+    dir=$(dirname "$file")
+
+    is_visited "$file" && return
+    _visited_files="$_visited_files $file"
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        line_clean=$(printf '%s\n' "$line" \
+            | sed 's/#.*//' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+        [ -z "$line_clean" ] && continue
+
+        case "$line_clean" in
+            import*)
+                patterns=$(printf '%s\n' "$line_clean" | cut -d' ' -f2-)
+                for pat in $patterns; do
+                    case "$pat" in
+                        /*) ;;
+                        *) pat="$dir/$pat" ;;
+                    esac
+                    for f in $pat; do
+                        [ -f "$f" ] && inline_imports "$f"
+                    done
+                done
+                ;;
+            *)
+                echo "$line_clean"
+                ;;
+        esac
+    done < "$file"
+}
+
+count_chars() {
+    printf '%s\n' "$1" | sed "s/[^$2]//g" | wc -c | awk '{print $1}'
+}
+
+# -----------------------------
+# Extract exactly one site block
+# -----------------------------
+
+extract_site_block() {
+    file="$1"
+    block=""
+    current=""
+    depth=0
+    in_block=0
+    count=0
+
+    inline_imports "$file" | while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            *[![:space:]]*"{"*)
+                if [ "$in_block" -eq 0 ]; then
+                    in_block=1
+                    depth=1
+                    current="$line"
+                    continue
+                fi
+                ;;
+        esac
+
+        if [ "$in_block" -eq 1 ]; then
+            open=$(count_chars "$line" "{")
+            close=$(count_chars "$line" "}")
+            depth=$((depth + open - close))
+            current="$current
+$line"
+
+            if [ "$depth" -le 0 ]; then
+                echo "===SITE_BLOCK_START==="
+                echo "$current"
+                echo "===SITE_BLOCK_END==="
+                in_block=0
+            fi
+        fi
+    done | awk '
+        BEGIN { n=0 }
+        /^===SITE_BLOCK_START===/ { n++; collecting=1; block=""; next }
+        /^===SITE_BLOCK_END===/   { collecting=0; print block; next }
+        collecting { block = block $0 "\n" }
+        END {
+            if (n == 0) { exit 1 }
+            if (n > 1)  { exit 2 }
+        }'
+}
+
+# -----------------------------
+# Port Discovery
+# -----------------------------
+
+caddy_get_ports() {
+    file="$1"
+    block=$(extract_site_block "$file") || {
+        echo "❌ Error: Expected exactly one site block" >&2
+        exit 1
+    }
+
+    addr_line=$(printf '%s\n' "$block" | head -n1 | sed 's/{//')
+    found=0
+
+    for addr in $addr_line; do
+        case "$addr" in
+            http://*)  echo 80; found=1 ;;
+            https://*) echo 443; found=1 ;;
+            *:*)
+                port=$(printf '%s\n' "$addr" | sed 's/.*://')
+                case "$port" in
+                    [0-9]*) echo "$port"; found=1 ;;
+                esac
+                ;;
+        esac
+    done
+
+    [ "$found" -eq 0 ] && echo 443
+}
+
+# -----------------------------
+# Root Discovery
+# -----------------------------
+
+caddy_get_root() {
+    file="$1"
+    block=$(extract_site_block "$file") || {
+        echo "❌ Error: Expected exactly one site block" >&2
+        exit 1
+    }
+
+    roots=$(printf '%s\n' "$block" \
+        | sed -n 's/^[[:space:]]*root[[:space:]]\{1,\}\*[[:space:]]\{1,\}\(.*\)/\1/p' \
+        | sed 's/[[:space:]]*$//' \
+        | sort -u)
+
+    count=$(printf '%s\n' "$roots" | wc -l | awk '{print $1}')
+
+    [ "$count" -eq 0 ] && {
+        echo "❌ Error: No root directive found" >&2
+        exit 1
+    }
+
+    [ "$count" -gt 1 ] && {
+        echo "❌ Error: Multiple roots found: $roots" >&2
+        exit 1
+    }
+
+    echo "$roots"
+}
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
+
+[ $# -ne 2 ] && {
+    echo "Usage: $0 [ports|root] /path/to/Caddyfile" >&2
+    exit 1
+}
+
+case "$1" in
+    ports) caddy_get_ports "$2" | sort -u ;;
+    root)  caddy_get_root "$2" ;;
+    *)
+        echo "Usage: $0 [ports|root] /path/to/Caddyfile" >&2
+        exit 1 ;;
+esac
+EOF
+
+RUN chmod +x /usr/local/bin/caddy_custom_script.sh
+
+FOR PORT IN RUN /usr/local/bin/caddy_custom_script.sh ports Caddyfile
+    ARG PORT=${PORT}
+    EXPOSE ${PORT}
+ENDFOR
+
 ARG NGINX_ROOT=${NGINX_ROOT}
 IF RUN /usr/local/bin/nginx_custom_script.sh root nginx.conf && [ -z "${NGINX_ROOT}" ]
     ARG NGINX_ROOT=${STDOUT:-/usr/share/nginx/html}
+ENDIF
+
+IF RUN /usr/local/bin/caddy_custom_script.sh root Caddyfile && [ -z "${NGINX_ROOT}" ]
+    ARG NGINX_ROOT=${STDOUT:-/srv}
 ENDIF
 
 IF PROC [ -n "${RUN_IMAGE}" ] && (echo "${RUN_IMAGE}" | grep -q "nginx\|caddy")
