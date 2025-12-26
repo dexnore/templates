@@ -410,8 +410,10 @@ IF PROC [ -n "${RUN_IMAGE}" ] && (echo "${RUN_IMAGE}" | grep -q "nginx\|caddy")
 	# Copy nginx/Caddy config
 	IF PROC --from=busybox:latest --mount=target=. [ -f "nginx.conf" ]
 		COPY --chown=root:root nginx.conf /etc/nginx/conf.d/default.conf
+        COPY --chown=root:root conf.d/*.conf nginx/*.conf /etc/nginx/conf.d/
+        COPY --chown=root:root mime.types /etc/nginx/mime.types
 	ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "Caddyfile" ]
-		COPY --chown=root:root Caddyfile /etc/caddy/Caddyfile
+		COPY --chown=root:root Caddyfile caddy.json /etc/caddy/
 	ENDIF
 ELSE
 	# Copy production dependencies
